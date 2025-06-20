@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,14 +29,14 @@ func main() {
 		log.Printf("INFO: Successfully loaded .env file")
 	}
 
-	PATREON_REDIRECT_URL := os.Getenv("PATREON_REDIRECT_URL")
+	PATREON_REDIRECT_URL := strings.TrimSpace(os.Getenv("PATREON_REDIRECT_URL"))
 	if PATREON_REDIRECT_URL == "" {
 		PATREON_REDIRECT_URL = "https://theforgerealm.com/auth/callback"
 	}
 
 	patreonOAuthConfig := &oauth2.Config{
-		ClientID:     os.Getenv("PATREON_CLIENT_ID"),
-		ClientSecret: os.Getenv("PATREON_CLIENT_SECRET"),
+		ClientID:     strings.TrimSpace(os.Getenv("PATREON_CLIENT_ID")),
+		ClientSecret: strings.TrimSpace(os.Getenv("PATREON_CLIENT_SECRET")),
 		RedirectURL:  PATREON_REDIRECT_URL,
 		Endpoint: oauth2.Endpoint{
 			AuthURL:  "https://www.patreon.com/oauth2/authorize",
@@ -74,7 +75,7 @@ func main() {
 	log.Printf("INFO: Registered HTTP routes")
 
 	// Server setup
-	port := os.Getenv("PORT")
+	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
 		port = "8080"
 		log.Printf("INFO: Using default port 8080")

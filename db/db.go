@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"crypto/sha256"
 	"encoding/hex"
@@ -27,7 +28,7 @@ type PostgresDB struct {
 
 // InitDB initializes the database connection pool
 func (db *PostgresDB) InitDB() error {
-	connString := os.Getenv("DATABASE_URL")
+	connString := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if connString == "" {
 		log.Printf("ERROR: DATABASE_URL environment variable is not set")
 		return fmt.Errorf("DATABASE_URL environment variable is not set")

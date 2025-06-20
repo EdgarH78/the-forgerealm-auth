@@ -304,7 +304,7 @@ func generateSecureRandomToken() string {
 }
 
 func generateJWT(patreonID, tierCode string) (string, error) {
-	secret := os.Getenv("JWT_SECRET_CURRENT")
+	secret := strings.TrimSpace(os.Getenv("JWT_SECRET_CURRENT"))
 	if secret == "" {
 		return "", fmt.Errorf("JWT_SECRET_CURRENT environment variable is not set")
 	}
@@ -321,7 +321,7 @@ func generateJWT(patreonID, tierCode string) (string, error) {
 
 // verifySignature verifies the webhook signature
 func verifySignature(r *http.Request, signature string) bool {
-	secret := os.Getenv("WEBHOOK_SECRET")
+	secret := strings.TrimSpace(os.Getenv("WEBHOOK_SECRET"))
 	if secret == "" {
 		log.Printf("ERROR: WEBHOOK_SECRET environment variable is not set")
 		return false

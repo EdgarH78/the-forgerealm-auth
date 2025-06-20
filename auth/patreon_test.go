@@ -19,6 +19,28 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// TestMain sets up environment variables for all tests
+func TestMain(m *testing.M) {
+	// Set up test environment variables
+	setupTestEnv()
+
+	// Run tests
+	code := m.Run()
+
+	// Clean up
+	os.Exit(code)
+}
+
+// setupTestEnv sets up environment variables needed for tests
+func setupTestEnv() {
+	// Set required environment variables for tests
+	os.Setenv("JWT_SECRET_CURRENT", "test_jwt_secret_key_for_testing")
+	os.Setenv("WEBHOOK_SECRET", "test_webhook_secret_for_testing")
+	os.Setenv("PATREON_CLIENT_ID", "test_client_id")
+	os.Setenv("PATREON_CLIENT_SECRET", "test_client_secret")
+	os.Setenv("PATREON_REDIRECT_URL", "http://localhost:8080/auth/callback")
+}
+
 // MockDatabase implements db.Database for testing
 type MockDatabase struct {
 	mock.Mock
@@ -464,10 +486,6 @@ func TestPatreonAuth_HandleRefresh_Success(t *testing.T) {
 	config := &oauth2.Config{}
 	auth := NewPatreonAuth(mockDB, config)
 
-	// Set JWT secret for testing
-	os.Setenv("JWT_SECRET", "test_secret_key_for_jwt_signing")
-	defer os.Unsetenv("JWT_SECRET")
-
 	// Mock successful refresh token verification and tier code retrieval
 	mockDB.On("VerifyRefreshToken", mock.Anything, "valid_refresh_token").Return("123", nil)
 	mockDB.On("GetTierCodeForUser", mock.Anything, "123").Return("apprentice", nil)
@@ -543,8 +561,10 @@ func TestPatreonAuth_HandleRefresh_JWTGenerationError(t *testing.T) {
 	config := &oauth2.Config{}
 	auth := NewPatreonAuth(mockDB, config)
 
-	// Don't set JWT_SECRET to cause JWT generation to fail
-	os.Unsetenv("JWT_SECRET")
+	// Temporarily unset JWT_SECRET_CURRENT to cause JWT generation to fail
+	originalSecret := os.Getenv("JWT_SECRET_CURRENT")
+	os.Unsetenv("JWT_SECRET_CURRENT")
+	defer os.Setenv("JWT_SECRET_CURRENT", originalSecret)
 
 	// Mock successful refresh token verification and tier code retrieval
 	mockDB.On("VerifyRefreshToken", mock.Anything, "valid_refresh_token").Return("123", nil)
@@ -566,10 +586,6 @@ func TestPatreonAuth_HandleRefresh_JWTGenerationError(t *testing.T) {
 }
 
 func TestGenerateJWT_Success(t *testing.T) {
-	// Set JWT secret for testing
-	os.Setenv("JWT_SECRET", "test_secret_key_for_jwt_signing")
-	defer os.Unsetenv("JWT_SECRET")
-
 	token, err := generateJWT("123", "apprentice")
 
 	assert.NoError(t, err)
@@ -577,7 +593,7 @@ func TestGenerateJWT_Success(t *testing.T) {
 
 	// Verify the token can be parsed and contains expected claims
 	parsedToken, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
-		return []byte("test_secret_key_for_jwt_signing"), nil
+		return []byte("test_jwt_secret_key_for_testing"), nil
 	})
 
 	assert.NoError(t, err)
@@ -592,12 +608,15 @@ func TestGenerateJWT_Success(t *testing.T) {
 }
 
 func TestGenerateJWT_MissingSecret(t *testing.T) {
-	os.Unsetenv("JWT_SECRET")
+	// Temporarily unset JWT_SECRET_CURRENT
+	originalSecret := os.Getenv("JWT_SECRET_CURRENT")
+	os.Unsetenv("JWT_SECRET_CURRENT")
+	defer os.Setenv("JWT_SECRET_CURRENT", originalSecret)
 
 	_, err := generateJWT("123", "apprentice")
 
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "JWT_SECRET")
+	assert.Contains(t, err.Error(), "JWT_SECRET_CURRENT")
 }
 
 func TestGenerateSecureRandomToken(t *testing.T) {

@@ -11,31 +11,49 @@ import (
 
 	"forgerealm-auth/auth"
 	"forgerealm-auth/db"
-	"forgerealm-auth/webhook"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
+	"golang.org/x/oauth2"
 )
 
 func main() {
+	log.Printf("INFO: Starting ForgeRealm Auth Service")
+
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
-		log.Printf("Warning: .env file not found")
+		log.Printf("WARN: .env file not found: %v", err)
+	} else {
+		log.Printf("INFO: Successfully loaded .env file")
+	}
+
+	PATREON_REDIRECT_URL := os.Getenv("PATREON_REDIRECT_URL")
+	if PATREON_REDIRECT_URL == "" {
+		PATREON_REDIRECT_URL = "https://theforgerealm.com/auth/callback"
+	}
+
+	patreonOAuthConfig := &oauth2.Config{
+		ClientID:     os.Getenv("PATREON_CLIENT_ID"),
+		ClientSecret: os.Getenv("PATREON_CLIENT_SECRET"),
+		RedirectURL:  PATREON_REDIRECT_URL,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  "https://www.patreon.com/oauth2/authorize",
+			TokenURL: "https://www.patreon.com/api/oauth2/token",
+		},
+		Scopes: []string{"identity", "identity[email]", "identity.memberships"},
 	}
 
 	// Initialize database
+	log.Printf("INFO: Initializing database connection")
+	db := db.PostgresDB{}
 	if err := db.InitDB(); err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		log.Fatalf("ERROR: Failed to initialize database: %v", err)
 	}
 	defer db.CloseDB()
 
-	// Create database tables
-	if err := db.CreateTables(context.Background()); err != nil {
-		log.Fatalf("Failed to create database tables: %v", err)
-	}
-
 	// Initialize router
+	log.Printf("INFO: Setting up HTTP router and middleware")
 	r := chi.NewRouter()
 
 	// Middleware
@@ -43,16 +61,25 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
 
+	patreonAuth := auth.NewPatreonAuth(&db, patreonOAuthConfig)
+	log.Printf("INFO: Initialized Patreon authentication handler")
+
 	// Routes
 	r.Get("/", handleHome)
-	r.Get("/auth/login", auth.HandlePatreonLogin)
-	r.Get("/auth/callback", auth.HandlePatreonCallback)
-	r.Post("/webhook", webhook.HandleWebhook)
+	r.Get("/healthz", handleHealthz)
+	r.Get("/auth/login", patreonAuth.HandleLogin)
+	r.Get("/auth/callback", patreonAuth.HandleCallback)
+	r.Post("/auth/webhook", patreonAuth.HandleWebhook)
+	r.Post("/auth/refresh", patreonAuth.HandleRefresh)
+	log.Printf("INFO: Registered HTTP routes")
 
 	// Server setup
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
+		log.Printf("INFO: Using default port 8080")
+	} else {
+		log.Printf("INFO: Using port %s from environment", port)
 	}
 
 	srv := &http.Server{
@@ -68,6 +95,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		<-sig
+		log.Printf("INFO: Received shutdown signal, starting graceful shutdown")
 
 		// Shutdown signal with grace period of 30 seconds
 		shutdownCtx, _ := context.WithTimeout(serverCtx, 30*time.Second)
@@ -75,44 +103,37 @@ func main() {
 		go func() {
 			<-shutdownCtx.Done()
 			if shutdownCtx.Err() == context.DeadlineExceeded {
-				log.Fatal("graceful shutdown timed out.. forcing exit.")
+				log.Fatal("ERROR: Graceful shutdown timed out, forcing exit")
 			}
 		}()
 
 		// Trigger graceful shutdown
 		err := srv.Shutdown(shutdownCtx)
 		if err != nil {
+			log.Printf("ERROR: Error during server shutdown: %v", err)
 			log.Fatal(err)
 		}
+		log.Printf("INFO: Server shutdown completed successfully")
 		serverStopCtx()
 	}()
 
 	// Run the server
-	log.Printf("Server starting on port %s", port)
+	log.Printf("INFO: Server starting on port %s", port)
 	err := srv.ListenAndServe()
 	if err != nil && err != http.ErrServerClosed {
+		log.Printf("ERROR: Server error: %v", err)
 		log.Fatal(err)
 	}
 
 	// Wait for server context to be stopped
 	<-serverCtx.Done()
+	log.Printf("INFO: Server context stopped, application exiting")
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Welcome to ForgeRealm Auth Service"))
 }
 
-func handlePatreonLogin(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement Patreon OAuth2 login
-	w.Write([]byte("Patreon login not implemented yet"))
-}
-
-func handlePatreonCallback(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement Patreon OAuth2 callback
-	w.Write([]byte("Patreon callback not implemented yet"))
-}
-
-func handleWebhook(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement webhook handler
-	w.Write([]byte("Webhook handler not implemented yet"))
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("OK"))
 }

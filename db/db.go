@@ -82,7 +82,7 @@ func (db *PostgresDB) SaveUser(ctx context.Context, patreonID, email, givenName,
 			updated_at = CURRENT_TIMESTAMP
 	`
 
-	log.Printf("INFO: Saving user to database (Patreon ID: %s, Email: %s, Given Name: %s, Sur Name: %s, Tier ID: %s, Patron Status: %s, Access Token: %s, Refresh Token: %s, Token Expiry: %s)", patreonID, email, givenName, surName, tierID, patronStatus, accessToken, refreshToken, tokenExpiry)
+	log.Printf("INFO: Saving user to database (Patreon ID: %s, Email: %s, Given Name: %s, Sur Name: %s, Tier ID: %s, Patron Status: %s)", patreonID, email, givenName, surName, tierID, patronStatus)
 	_, err := db.pool.Exec(ctx, query, patreonID, email, givenName, surName, tierID,
 		patronStatus, accessToken, refreshToken, tokenExpiry)
 	if err != nil {

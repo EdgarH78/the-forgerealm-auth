@@ -37,5 +37,4 @@ jobs:
             --region us-central1 \
             --allow-unauthenticated \
             --project ${{ secrets.GCP_PROJECT_ID }} \
-            --update-secrets "JWT_SECRET_CURRENT=JWT_SECRET_CURRENT:latest,JWT_SECRET_NEXT=JWT_SECRET_NEXT:latest,PATREON_CLIENT_ID=PATREON_CLIENT_ID:latest,PATREON_CLIENT_SECRET=PATREON_CLIENT_SECRET:latest,WEB_HOOK_SECRET=WEB_HOOK_SECRET:latest,DATABASE_URL=AUTH_DB_URL:latest" \
-            --set-env-vars "PATREON_REDIRECT_URL=https://theforgerealm.com/auth/callback"
+            --update-secrets "JWT_SECRET_CURRENT=JWT_SECRET_CURRENT:latest,JWT_SECRET_NEXT=JWT_SECRET_NEXT:latest,PATREON_CLIENT_ID=PATREON_CLIENT_ID:latest,PATREON_CLIENT_SECRET=PATREON_CLIENT_SECRET:latest,WEB_HOOK_SECRET=WEB_HOOK_SECRET:latest,DATABASE_URL=AUTH_DB_URL:latest,PATREON_REDIRECT_URL=PATREON_REDIRECT_URL:latest"

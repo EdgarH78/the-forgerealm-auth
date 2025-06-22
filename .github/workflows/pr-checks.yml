@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -17,5 +18,10 @@ jobs:
         with:
           go-version: '1.23'
 
+      - name: Enable Docker for testcontainers-go
+        run: |
+          docker --version
+          docker info
+
       - name: Run tests
-        run: go test ./...
+        run: go test ./... -v

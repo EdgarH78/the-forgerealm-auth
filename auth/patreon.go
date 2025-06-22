@@ -19,8 +19,6 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"forgerealm-auth/db"
-
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/oauth2"
 )
@@ -67,12 +65,28 @@ type ExternalAuth interface {
 	HandleWebhook(http.ResponseWriter, *http.Request)
 }
 
-type PatreonAuth struct {
-	patreonOAuthConfig *oauth2.Config
-	db                 db.Database
+type PatreonAuthDb interface {
+	SaveUser(ctx context.Context, patreonID, email, givenName, surName, tierID, patronStatus, accessToken, refreshToken string, tokenExpiry pgtype.Timestamp) error
+	SaveWebhookEvent(ctx context.Context, eventTypeID, patreonID, tierID, patronStatus string, rawPayload []byte) error
+	VerifyRefreshToken(ctx context.Context, token string) (string, error)
+	StoreRefreshToken(ctx context.Context, patreonID, token string) error
+	GetTierCodeForUser(ctx context.Context, patreonID string) (string, error)
+	FulfillTokenLogin(ctx context.Context, token string, userID string) error
 }
 
-func NewPatreonAuth(db db.Database, patreonOAuthConfig *oauth2.Config) *PatreonAuth {
+// OAuth2Config interface defines the OAuth2 methods we use
+type OAuth2Config interface {
+	AuthCodeURL(state string, opts ...oauth2.AuthCodeOption) string
+	Exchange(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error)
+	Client(ctx context.Context, t *oauth2.Token) *http.Client
+}
+
+type PatreonAuth struct {
+	patreonOAuthConfig OAuth2Config
+	db                 PatreonAuthDb
+}
+
+func NewPatreonAuth(db PatreonAuthDb, patreonOAuthConfig OAuth2Config) *PatreonAuth {
 	return &PatreonAuth{
 		patreonOAuthConfig: patreonOAuthConfig,
 		db:                 db,
@@ -81,7 +95,11 @@ func NewPatreonAuth(db db.Database, patreonOAuthConfig *oauth2.Config) *PatreonA
 
 // HandlePatreonLogin initiates the Patreon OAuth2 flow
 func (a *PatreonAuth) HandleLogin(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
 	url := a.patreonOAuthConfig.AuthCodeURL("state", oauth2.AccessTypeOffline)
+	if token != "" {
+		url = a.patreonOAuthConfig.AuthCodeURL(token, oauth2.AccessTypeOffline)
+	}
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
@@ -222,6 +240,17 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to save user: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	login_token := r.URL.Query().Get("state")
+	if login_token == "" {
+		log.Println("No login token (state param) returned in OAuth callback")
+	} else if login_token != "state" {
+		err = a.db.FulfillTokenLogin(r.Context(), login_token, userID)
+		if err != nil {
+			log.Printf("ERROR: Failed to fulfill token login (Patreon ID: %s): %v", userID, err)
+			http.Error(w, "Failed to fulfill token login: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 
 	jwtToken, err := generateJWT(userID, tierTitle)
 	if err != nil {
@@ -295,6 +324,37 @@ func (a *PatreonAuth) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (a *PatreonAuth) HandleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	authCookie, err := r.Cookie("scryforge_auth")
+	if err == nil {
+		// Try parsing the JWT
+		secret := os.Getenv("JWT_SECRET_CURRENT")
+		token, err := jwt.Parse(authCookie.Value, func(t *jwt.Token) (interface{}, error) {
+			return []byte(secret), nil
+		})
+		if err == nil && token.Valid {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "authenticated"})
+			return
+		}
+	}
+
+	// Try checking refresh token
+	refreshCookie, err := r.Cookie("scryforge_refresh")
+	if err == nil {
+		userID, err := a.db.VerifyRefreshToken(r.Context(), refreshCookie.Value)
+		if err == nil && userID != "" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "renewal_required"})
+			return
+		}
+	}
+
+	// No valid session or refresh token
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "unauthenticated"})
 }
 
 func generateSecureRandomToken() string {

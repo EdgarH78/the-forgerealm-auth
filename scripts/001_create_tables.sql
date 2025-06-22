@@ -1,6 +1,9 @@
 -- Enable UUID generation
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
+-- Create schema
+CREATE SCHEMA IF NOT EXISTS forgerealm_auth;
+
 -- Tiers table
 CREATE TABLE IF NOT EXISTS forgerealm_auth.tiers (
   id TEXT PRIMARY KEY,         -- Patreon tier ID
@@ -23,7 +26,7 @@ CREATE TABLE IF NOT EXISTS forgerealm_auth.users (
   given_name TEXT,
   sur_name TEXT,
 
-  tier_id TEXT REFERENCES tiers(id),
+  tier_id TEXT REFERENCES forgerealm_auth.tiers(id),
   patron_status TEXT,              -- e.g. 'active_patron', 'former_patron'
 
   access_token TEXT,
@@ -76,3 +79,14 @@ CREATE TABLE forgerealm_auth.refresh_tokens (
     ip_address TEXT,
     revoked BOOLEAN NOT NULL DEFAULT false
 );
+
+CREATE TABLE forgerealm_auth.token_logins (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  token TEXT NOT NULL,
+  user_id UUID REFERENCES forgerealm_auth.users(id) ON DELETE CASCADE,
+  fulfilled BOOLEAN NOT NULL DEFAULT false,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX ON forgerealm_auth.token_logins(token); 

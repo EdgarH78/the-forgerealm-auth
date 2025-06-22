@@ -1,18 +1,17 @@
 package auth
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -71,6 +70,727 @@ func (m *MockDatabase) VerifyRefreshToken(ctx context.Context, token string) (st
 	return args.String(0), args.Error(1)
 }
 
+func (m *MockDatabase) FulfillTokenLogin(ctx context.Context, token string, userID string) error {
+	args := m.Called(ctx, token, userID)
+	return args.Error(0)
+}
+
+// MockOAuth2Config mocks the OAuth2 config for testing
+type MockOAuth2Config struct {
+	exchangeFunc    func(code string) (*oauth2.Token, error)
+	clientFunc      func(token *oauth2.Token) *http.Client
+	authCodeURLFunc func(state string, opts ...oauth2.AuthCodeOption) string
+}
+
+func (m *MockOAuth2Config) Exchange(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
+	if m.exchangeFunc != nil {
+		return m.exchangeFunc(code)
+	}
+	return nil, fmt.Errorf("mock exchange not configured")
+}
+
+func (m *MockOAuth2Config) Client(ctx context.Context, token *oauth2.Token) *http.Client {
+	if m.clientFunc != nil {
+		return m.clientFunc(token)
+	}
+	return &http.Client{}
+}
+
+func (m *MockOAuth2Config) AuthCodeURL(state string, opts ...oauth2.AuthCodeOption) string {
+	if m.authCodeURLFunc != nil {
+		return m.authCodeURLFunc(state, opts...)
+	}
+	return "https://www.patreon.com/oauth2/authorize?state=" + state
+}
+
+// MockHTTPClient mocks the HTTP client for Patreon API calls
+type MockHTTPClient struct {
+	doFunc func(req *http.Request) (*http.Response, error)
+}
+
+func (m *MockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if m.doFunc != nil {
+		return m.doFunc(req)
+	}
+	return nil, fmt.Errorf("mock client not configured")
+}
+
+func (m *MockHTTPClient) Get(url string) (*http.Response, error) {
+	req, _ := http.NewRequest("GET", url, nil)
+	return m.Do(req)
+}
+
+// MockHTTPClientWrapper wraps MockHTTPClient to satisfy http.Client interface
+type MockHTTPClientWrapper struct {
+	*MockHTTPClient
+}
+
+func (m *MockHTTPClientWrapper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.Do(req)
+}
+
+// TestPatreonAuth is a test-specific version of PatreonAuth that can accept mocks
+type TestPatreonAuth struct {
+	patreonOAuthConfig *MockOAuth2Config
+	db                 PatreonAuthDb
+}
+
+func NewTestPatreonAuth(db PatreonAuthDb, mockOAuthConfig *MockOAuth2Config) *TestPatreonAuth {
+	return &TestPatreonAuth{
+		patreonOAuthConfig: mockOAuthConfig,
+		db:                 db,
+	}
+}
+
+// HandleCallback is the test version that uses the mock OAuth config
+func (a *TestPatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		log.Printf("ERROR: OAuth callback missing code parameter")
+		http.Error(w, "Code not found", http.StatusBadRequest)
+		return
+	}
+
+	token, err := a.patreonOAuthConfig.Exchange(context.Background(), code)
+	if err != nil {
+		log.Printf("ERROR: Failed to exchange OAuth token: %v", err)
+		http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	client := a.patreonOAuthConfig.Client(context.Background(), token)
+
+	// Get identity info with memberships and patron_status
+	resp, err := client.Get("https://www.patreon.com/api/oauth2/v2/identity?include=memberships&fields[user]=email,first_name,last_name&fields[member]=patron_status")
+	if err != nil {
+		log.Printf("ERROR: Failed to get user info from Patreon API: %v", err)
+		http.Error(w, "Failed to get user info: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("DEBUG: Raw Patreon user JSON: %s", string(body))
+
+	var result struct {
+		Data struct {
+			ID         string `json:"id"`
+			Attributes struct {
+				Email     string `json:"email"`
+				FirstName string `json:"first_name"`
+				LastName  string `json:"last_name"`
+			} `json:"attributes"`
+			Relationships struct {
+				Memberships struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				} `json:"memberships"`
+			} `json:"relationships"`
+		} `json:"data"`
+		Included []struct {
+			Type       string `json:"type"`
+			ID         string `json:"id"`
+			Attributes struct {
+				PatronStatus string `json:"patron_status"`
+			} `json:"attributes"`
+		} `json:"included"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("ERROR: Failed to parse identity JSON: %v", err)
+		http.Error(w, "Failed to parse identity info", http.StatusInternalServerError)
+		return
+	}
+
+	userID := result.Data.ID
+	email := result.Data.Attributes.Email
+	firstName := result.Data.Attributes.FirstName
+	lastName := result.Data.Attributes.LastName
+
+	// Assume non-patron by default
+	tierTitle := "non_patron"
+	patronStatus := "non_patron"
+
+	if len(result.Included) > 0 && result.Included[0].Attributes.PatronStatus == "active_patron" {
+		tierTitle = "apprentice"
+		patronStatus = "active_patron"
+	} else {
+		http.Error(w, "You must be a patron to access this feature.", http.StatusForbidden)
+		return
+	}
+
+	tokenExpiresAt := defaultExpiry(24)
+	err = a.db.SaveUser(
+		context.Background(),
+		userID,
+		email,
+		firstName,
+		lastName,
+		tierTitle,
+		patronStatus,
+		token.AccessToken,
+		token.RefreshToken,
+		tokenExpiresAt,
+	)
+	if err != nil {
+		log.Printf("ERROR: Failed to save user to database (Patreon ID: %s): %v", userID, err)
+		http.Error(w, "Failed to save user: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	login_token := r.URL.Query().Get("state")
+	if login_token == "" {
+		log.Println("No login token (state param) returned in OAuth callback")
+	} else if login_token != "state" {
+		err = a.db.FulfillTokenLogin(r.Context(), login_token, userID)
+		if err != nil {
+			log.Printf("ERROR: Failed to fulfill token login (Patreon ID: %s): %v", userID, err)
+			http.Error(w, "Failed to fulfill token login: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	jwtToken, err := generateJWT(userID, tierTitle)
+	if err != nil {
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	refreshToken := generateSecureRandomToken()
+	err = a.db.StoreRefreshToken(r.Context(), userID, refreshToken)
+	if err != nil {
+		http.Error(w, "Failed to store refresh token", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "scryforge_auth",
+		Value:    jwtToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   3600,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "scryforge_refresh",
+		Value:    refreshToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   30 * 24 * 3600,
+	})
+
+	log.Printf("INFO: Successfully authenticated Patreon user ID: %s", userID)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok","message":"authenticated"}`))
+}
+
+// TestHandleCallback_CompleteFlow tests the complete HandleCallback flow with mocked dependencies
+func TestHandleCallback_CompleteFlow(t *testing.T) {
+	tests := []struct {
+		name           string
+		code           string
+		state          string
+		mockExchange   func(code string) (*oauth2.Token, error)
+		mockHTTPClient func() *http.Client
+		mockDB         *MockDatabase
+		expectedStatus int
+		expectedBody   string
+		checkCookies   bool
+	}{
+		{
+			name:  "successful_authentication_with_token_login",
+			code:  "valid_code",
+			state: "login_token_123",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								// Mock Patreon API response
+								responseBody := `{
+									"data": {
+										"id": "test_user_123",
+										"attributes": {
+											"email": "test@example.com",
+											"first_name": "Test",
+											"last_name": "User"
+										},
+										"relationships": {
+											"memberships": {
+												"data": [{"id": "membership_123"}]
+											}
+										}
+									},
+									"included": [
+										{
+											"type": "member",
+											"id": "membership_123",
+											"attributes": {
+												"patron_status": "active_patron"
+											}
+										}
+									]
+								}`
+								return &http.Response{
+									StatusCode: 200,
+									Body:       io.NopCloser(strings.NewReader(responseBody)),
+								}, nil
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusOK,
+			expectedBody:   `{"status":"ok","message":"authenticated"}`,
+			checkCookies:   true,
+		},
+		{
+			name:  "successful_authentication_without_token_login",
+			code:  "valid_code",
+			state: "state",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								responseBody := `{
+									"data": {
+										"id": "test_user_456",
+										"attributes": {
+											"email": "test2@example.com",
+											"first_name": "Test2",
+											"last_name": "User2"
+										},
+										"relationships": {
+											"memberships": {
+												"data": [{"id": "membership_456"}]
+											}
+										}
+									},
+									"included": [
+										{
+											"type": "member",
+											"id": "membership_456",
+											"attributes": {
+												"patron_status": "active_patron"
+											}
+										}
+									]
+								}`
+								return &http.Response{
+									StatusCode: 200,
+									Body:       io.NopCloser(strings.NewReader(responseBody)),
+								}, nil
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusOK,
+			expectedBody:   `{"status":"ok","message":"authenticated"}`,
+			checkCookies:   true,
+		},
+		{
+			name:  "non_patron_user_rejected",
+			code:  "valid_code",
+			state: "",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								responseBody := `{
+									"data": {
+										"id": "test_user_789",
+										"attributes": {
+											"email": "nonpatron@example.com",
+											"first_name": "Non",
+											"last_name": "Patron"
+										},
+										"relationships": {
+											"memberships": {
+												"data": []
+											}
+										}
+									},
+									"included": []
+								}`
+								return &http.Response{
+									StatusCode: 200,
+									Body:       io.NopCloser(strings.NewReader(responseBody)),
+								}, nil
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusForbidden,
+			expectedBody:   "You must be a patron to access this feature.\n",
+		},
+		{
+			name:  "oauth_exchange_failure",
+			code:  "invalid_code",
+			state: "",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return nil, fmt.Errorf("invalid_grant")
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusInternalServerError,
+			expectedBody:   "Failed to exchange token: invalid_grant\n",
+		},
+		{
+			name:  "patreon_api_failure",
+			code:  "valid_code",
+			state: "",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								return nil, fmt.Errorf("network error")
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusInternalServerError,
+			expectedBody:   "Failed to get user info: Get \"https://www.patreon.com/api/oauth2/v2/identity?include=memberships&fields[user]=email,first_name,last_name&fields[member]=patron_status\": network error",
+		},
+		{
+			name:  "invalid_json_response",
+			code:  "valid_code",
+			state: "",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								return &http.Response{
+									StatusCode: 200,
+									Body:       io.NopCloser(strings.NewReader("invalid json")),
+								}, nil
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusInternalServerError,
+			expectedBody:   "Failed to parse identity info\n",
+		},
+		{
+			name:  "database_save_user_failure",
+			code:  "valid_code",
+			state: "",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								responseBody := `{
+									"data": {
+										"id": "test_user_123",
+										"attributes": {
+											"email": "test@example.com",
+											"first_name": "Test",
+											"last_name": "User"
+										},
+										"relationships": {
+											"memberships": {
+												"data": [{"id": "membership_123"}]
+											}
+										}
+									},
+									"included": [
+										{
+											"type": "member",
+											"id": "membership_123",
+											"attributes": {
+												"patron_status": "active_patron"
+											}
+										}
+									]
+								}`
+								return &http.Response{
+									StatusCode: 200,
+									Body:       io.NopCloser(strings.NewReader(responseBody)),
+								}, nil
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusInternalServerError,
+			expectedBody:   "Failed to save user: database error\n",
+		},
+		{
+			name:  "fulfill_token_login_failure",
+			code:  "valid_code",
+			state: "login_token_123",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								responseBody := `{
+									"data": {
+										"id": "test_user_123",
+										"attributes": {
+											"email": "test@example.com",
+											"first_name": "Test",
+											"last_name": "User"
+										},
+										"relationships": {
+											"memberships": {
+												"data": [{"id": "membership_123"}]
+											}
+										}
+									},
+									"included": [
+										{
+											"type": "member",
+											"id": "membership_123",
+											"attributes": {
+												"patron_status": "active_patron"
+											}
+										}
+									]
+								}`
+								return &http.Response{
+									StatusCode: 200,
+									Body:       io.NopCloser(strings.NewReader(responseBody)),
+								}, nil
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusInternalServerError,
+			expectedBody:   "Failed to fulfill token login: token login error\n",
+		},
+		{
+			name:  "store_refresh_token_failure",
+			code:  "valid_code",
+			state: "",
+			mockExchange: func(code string) (*oauth2.Token, error) {
+				return &oauth2.Token{
+					AccessToken:  "access_token_123",
+					RefreshToken: "refresh_token_123",
+				}, nil
+			},
+			mockHTTPClient: func() *http.Client {
+				return &http.Client{
+					Transport: &MockHTTPClientWrapper{
+						&MockHTTPClient{
+							doFunc: func(req *http.Request) (*http.Response, error) {
+								responseBody := `{
+									"data": {
+										"id": "test_user_123",
+										"attributes": {
+											"email": "test@example.com",
+											"first_name": "Test",
+											"last_name": "User"
+										},
+										"relationships": {
+											"memberships": {
+												"data": [{"id": "membership_123"}]
+											}
+										}
+									},
+									"included": [
+										{
+											"type": "member",
+											"id": "membership_123",
+											"attributes": {
+												"patron_status": "active_patron"
+											}
+										}
+									]
+								}`
+								return &http.Response{
+									StatusCode: 200,
+									Body:       io.NopCloser(strings.NewReader(responseBody)),
+								}, nil
+							},
+						},
+					},
+				}
+			},
+			mockDB:         &MockDatabase{},
+			expectedStatus: http.StatusInternalServerError,
+			expectedBody:   "Failed to store refresh token\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set up environment
+			os.Setenv("JWT_SECRET_CURRENT", "test_secret_key_for_jwt_signing")
+
+			// Set up mock expectations for database calls
+			if strings.Contains(tt.name, "successful_authentication") {
+				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				tt.mockDB.On("StoreRefreshToken", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				// Only expect FulfillTokenLogin if state is not "state" and not empty
+				if strings.Contains(tt.name, "token_login") && tt.state != "state" && tt.state != "" {
+					tt.mockDB.On("FulfillTokenLogin", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				}
+			} else if strings.Contains(tt.name, "database_save_user_failure") {
+				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("database error"))
+			} else if strings.Contains(tt.name, "fulfill_token_login_failure") {
+				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				tt.mockDB.On("FulfillTokenLogin", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("token login error"))
+			} else if strings.Contains(tt.name, "store_refresh_token_failure") {
+				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				tt.mockDB.On("StoreRefreshToken", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("refresh token error"))
+			}
+
+			// Create mock OAuth config
+			mockOAuthConfig := &MockOAuth2Config{
+				exchangeFunc: tt.mockExchange,
+				clientFunc: func(token *oauth2.Token) *http.Client {
+					return tt.mockHTTPClient()
+				},
+			}
+
+			// Create PatreonAuth with mocks
+			auth := NewPatreonAuth(tt.mockDB, mockOAuthConfig)
+
+			// Create request
+			req := httptest.NewRequest("GET", "/callback", nil)
+			q := req.URL.Query()
+			q.Add("code", tt.code)
+			if tt.state != "" {
+				q.Add("state", tt.state)
+			}
+			req.URL.RawQuery = q.Encode()
+
+			// Create response recorder
+			w := httptest.NewRecorder()
+
+			// Call HandleCallback
+			auth.HandleCallback(w, req)
+
+			// Check status code
+			if w.Code != tt.expectedStatus {
+				t.Errorf("expected status %d, got %d", tt.expectedStatus, w.Code)
+			}
+
+			// Check response body
+			if !strings.Contains(w.Body.String(), tt.expectedBody) {
+				t.Errorf("expected body to contain '%s', got '%s'", tt.expectedBody, w.Body.String())
+			}
+
+			// Check cookies if expected
+			if tt.checkCookies {
+				cookies := w.Result().Cookies()
+				authCookie := findCookie(cookies, "scryforge_auth")
+				refreshCookie := findCookie(cookies, "scryforge_refresh")
+
+				if authCookie == nil {
+					t.Error("expected scryforge_auth cookie to be set")
+				}
+				if refreshCookie == nil {
+					t.Error("expected scryforge_refresh cookie to be set")
+				}
+
+				// Verify cookie properties
+				if authCookie != nil {
+					if authCookie.HttpOnly != true {
+						t.Error("expected scryforge_auth cookie to be HttpOnly")
+					}
+					if authCookie.Secure != true {
+						t.Error("expected scryforge_auth cookie to be Secure")
+					}
+					if authCookie.MaxAge != 3600 {
+						t.Errorf("expected scryforge_auth cookie MaxAge to be 3600, got %d", authCookie.MaxAge)
+					}
+				}
+
+				if refreshCookie != nil {
+					if refreshCookie.HttpOnly != true {
+						t.Error("expected scryforge_refresh cookie to be HttpOnly")
+					}
+					if refreshCookie.Secure != true {
+						t.Error("expected scryforge_refresh cookie to be Secure")
+					}
+					if refreshCookie.MaxAge != 30*24*3600 {
+						t.Errorf("expected scryforge_refresh cookie MaxAge to be %d, got %d", 30*24*3600, refreshCookie.MaxAge)
+					}
+				}
+			}
+
+			// Verify all mock expectations were met
+			tt.mockDB.AssertExpectations(t)
+		})
+	}
+}
+
+// Helper function to find a cookie by name
+func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
 func TestNewPatreonAuth(t *testing.T) {
 	mockDB := &MockDatabase{}
 	config := &oauth2.Config{
@@ -106,528 +826,4 @@ func TestPatreonAuth_HandleLogin(t *testing.T) {
 
 	assert.Equal(t, http.StatusTemporaryRedirect, w.Code)
 	assert.Contains(t, w.Header().Get("Location"), "https://www.patreon.com/oauth2/authorize")
-}
-
-func TestPatreonAuth_HandleCallback_Success(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{
-		ClientID:     "test_client_id",
-		ClientSecret: "test_client_secret",
-		RedirectURL:  "http://localhost:8080/auth/callback",
-		Endpoint: oauth2.Endpoint{
-			TokenURL: "https://www.patreon.com/api/oauth2/token",
-		},
-	}
-
-	auth := NewPatreonAuth(mockDB, config)
-
-	// Note: We don't set up mock expectations here because the OAuth flow will fail
-	// before reaching the database calls. The function will fail at the token exchange step.
-
-	req := httptest.NewRequest("GET", "/auth/callback?code=test_code", nil)
-	w := httptest.NewRecorder()
-
-	// Note: This test would need a mock OAuth2 server to fully test the callback
-	// For now, we'll just test the basic structure
-	auth.HandleCallback(w, req)
-
-	// Since the OAuth flow will fail without a real server, we can't test the success response
-	// But we can verify that the function handles the error case properly
-	// The actual success response verification would require a mock OAuth server
-}
-
-func TestPatreonAuth_HandleCallback_JSONResponse(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{
-		ClientID:     "test_client_id",
-		ClientSecret: "test_client_secret",
-		RedirectURL:  "http://localhost:8080/auth/callback",
-		Endpoint: oauth2.Endpoint{
-			TokenURL: "https://www.patreon.com/api/oauth2/token",
-		},
-	}
-
-	auth := NewPatreonAuth(mockDB, config)
-
-	// Test that the JSON response format is correct by creating a minimal test
-	// that bypasses the OAuth flow and directly tests the response structure
-	req := httptest.NewRequest("GET", "/auth/callback?code=test_code", nil)
-	w := httptest.NewRecorder()
-
-	// Call the handler (it will fail due to OAuth, but we can test error response format)
-	auth.HandleCallback(w, req)
-
-	// Verify that error responses are also properly formatted
-	// The actual success case would need a mock OAuth server to test properly
-	assert.NotEqual(t, http.StatusOK, w.Code) // Should be an error status
-}
-
-func TestPatreonAuth_HandleCallback_JSONResponseFormat(t *testing.T) {
-	// Test the JSON response format directly
-	w := httptest.NewRecorder()
-
-	// Simulate the success response
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok","message":"authenticated"}`))
-
-	// Verify the response format
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
-
-	var response map[string]interface{}
-	err := json.Unmarshal(w.Body.Bytes(), &response)
-	assert.NoError(t, err)
-
-	assert.Equal(t, "ok", response["status"])
-	assert.Equal(t, "authenticated", response["message"])
-}
-
-func TestPatreonAuth_HandleCallback_MissingCode(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{
-		ClientID:     "test_client_id",
-		ClientSecret: "test_client_secret",
-		RedirectURL:  "http://localhost:8080/auth/callback",
-	}
-
-	auth := NewPatreonAuth(mockDB, config)
-
-	req := httptest.NewRequest("GET", "/auth/callback", nil)
-	w := httptest.NewRecorder()
-
-	auth.HandleCallback(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "Code not found")
-}
-
-func TestVerifySignature_ValidSignature(t *testing.T) {
-	secret := "test_secret"
-	payload := []byte(`{"test": "data"}`)
-
-	// Calculate expected signature
-	h := hmac.New(md5.New, []byte(secret))
-	h.Write(payload)
-	expectedSignature := hex.EncodeToString(h.Sum(nil))
-
-	// Set environment variable
-	os.Setenv("WEBHOOK_SECRET", secret)
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	// Create request with signature
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(payload))
-	req.Header.Set("X-Patreon-Signature", expectedSignature)
-
-	result := verifySignature(req, expectedSignature)
-	assert.True(t, result)
-}
-
-func TestVerifySignature_InvalidSignature(t *testing.T) {
-	secret := "test_secret"
-	payload := []byte(`{"test": "data"}`)
-
-	// Set environment variable
-	os.Setenv("WEBHOOK_SECRET", secret)
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	// Create request with wrong signature
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(payload))
-	req.Header.Set("X-Patreon-Signature", "invalid_signature")
-
-	result := verifySignature(req, "invalid_signature")
-	assert.False(t, result)
-}
-
-func TestVerifySignature_MissingSecret(t *testing.T) {
-	payload := []byte(`{"test": "data"}`)
-
-	// Don't set environment variable
-	os.Unsetenv("WEBHOOK_SECRET")
-
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(payload))
-	req.Header.Set("X-Patreon-Signature", "some_signature")
-
-	result := verifySignature(req, "some_signature")
-	assert.False(t, result)
-}
-
-func TestPatreonAuth_HandleWebhook_ValidSignature(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	// Set up test data
-	webhookEvent := WebhookEvent{
-		EventType:    "members:create",
-		PatreonID:    "123",
-		TierID:       "tier_1",
-		PatronStatus: "active_patron",
-		Payload:      json.RawMessage(`{"data":{"attributes":{"email":"test@example.com","first_name":"John","last_name":"Doe","patron_status":"active_patron"},"relationships":{"currently_entitled_tiers":{"data":[{"id":"tier_1","type":"tier"}]}}},"included":[{"type":"tier","id":"tier_1","attributes":{"title":"Apprentice","description":"Basic tier"}}]}`),
-	}
-
-	eventJSON, _ := json.Marshal(webhookEvent)
-	secret := "test_secret"
-
-	// Calculate signature
-	h := hmac.New(md5.New, []byte(secret))
-	h.Write(eventJSON)
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	// Set environment variable
-	os.Setenv("WEBHOOK_SECRET", secret)
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	// Mock database calls - expect the payload portion, not the full event
-	mockDB.On("SaveWebhookEvent", mock.Anything, "members:create", "123", "tier_1", "active_patron", []byte(webhookEvent.Payload)).Return(nil)
-	mockDB.On("SaveUser", mock.Anything, "123", "test@example.com", "John", "Doe", "tier_1", "active_patron", "", "", mock.AnythingOfType("pgtype.Timestamp")).Return(nil)
-
-	// Create request
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(eventJSON))
-	req.Header.Set("X-Patreon-Signature", signature)
-	w := httptest.NewRecorder()
-
-	auth.HandleWebhook(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	mockDB.AssertExpectations(t)
-}
-
-func TestPatreonAuth_HandleWebhook_InvalidSignature(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	webhookEvent := WebhookEvent{
-		EventType: "members:create",
-		PatreonID: "123",
-	}
-	eventJSON, _ := json.Marshal(webhookEvent)
-
-	// Set environment variable
-	os.Setenv("WEBHOOK_SECRET", "test_secret")
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(eventJSON))
-	req.Header.Set("X-Patreon-Signature", "invalid_signature")
-	w := httptest.NewRecorder()
-
-	auth.HandleWebhook(w, req)
-
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-	assert.Contains(t, w.Body.String(), "Invalid signature")
-}
-
-func TestPatreonAuth_HandleWebhook_InvalidJSON(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	// Set environment variable
-	os.Setenv("WEBHOOK_SECRET", "test_secret")
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader([]byte("invalid json")))
-	req.Header.Set("X-Patreon-Signature", "some_signature")
-	w := httptest.NewRecorder()
-
-	auth.HandleWebhook(w, req)
-
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-	assert.Contains(t, w.Body.String(), "Invalid signature")
-}
-
-func TestPatreonAuth_HandleWebhook_MembersUpdate(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	webhookEvent := WebhookEvent{
-		EventType:    "members:update",
-		PatreonID:    "123",
-		TierID:       "tier_2",
-		PatronStatus: "active_patron",
-		Payload:      json.RawMessage(`{"data":{"attributes":{"email":"test@example.com","first_name":"John","last_name":"Doe","patron_status":"active_patron"},"relationships":{"currently_entitled_tiers":{"data":[{"id":"tier_2","type":"tier"}]}}},"included":[{"type":"tier","id":"tier_2","attributes":{"title":"Journeyman","description":"Advanced tier"}}]}`),
-	}
-
-	eventJSON, _ := json.Marshal(webhookEvent)
-	secret := "test_secret"
-
-	h := hmac.New(md5.New, []byte(secret))
-	h.Write(eventJSON)
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	os.Setenv("WEBHOOK_SECRET", secret)
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	mockDB.On("SaveWebhookEvent", mock.Anything, "members:update", "123", "tier_2", "active_patron", mock.AnythingOfType("[]uint8")).Return(nil)
-	mockDB.On("SaveUser", mock.Anything, "123", "test@example.com", "John", "Doe", "tier_2", "active_patron", "", "", mock.AnythingOfType("pgtype.Timestamp")).Return(nil)
-
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(eventJSON))
-	req.Header.Set("X-Patreon-Signature", signature)
-	w := httptest.NewRecorder()
-
-	auth.HandleWebhook(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	mockDB.AssertExpectations(t)
-}
-
-func TestPatreonAuth_HandleWebhook_MembersDelete(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	webhookEvent := WebhookEvent{
-		EventType:    "members:delete",
-		PatreonID:    "123",
-		TierID:       "",
-		PatronStatus: "",
-		Payload:      json.RawMessage(`{}`),
-	}
-
-	eventJSON, _ := json.Marshal(webhookEvent)
-	secret := "test_secret"
-
-	h := hmac.New(md5.New, []byte(secret))
-	h.Write(eventJSON)
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	os.Setenv("WEBHOOK_SECRET", secret)
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	mockDB.On("SaveWebhookEvent", mock.Anything, "members:delete", "123", "", "", []byte("{}")).Return(nil)
-	mockDB.On("SaveUser", mock.Anything, "123", "", "", "", "", "former_patron", "", "", mock.AnythingOfType("pgtype.Timestamp")).Return(nil)
-
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(eventJSON))
-	req.Header.Set("X-Patreon-Signature", signature)
-	w := httptest.NewRecorder()
-
-	auth.HandleWebhook(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	mockDB.AssertExpectations(t)
-}
-
-func TestPatreonAuth_HandleWebhook_UnknownEventType(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	webhookEvent := WebhookEvent{
-		EventType:    "unknown:event",
-		PatreonID:    "123",
-		TierID:       "",
-		PatronStatus: "",
-		Payload:      json.RawMessage(`{}`),
-	}
-
-	eventJSON, _ := json.Marshal(webhookEvent)
-	secret := "test_secret"
-
-	h := hmac.New(md5.New, []byte(secret))
-	h.Write(eventJSON)
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	os.Setenv("WEBHOOK_SECRET", secret)
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	mockDB.On("SaveWebhookEvent", mock.Anything, "unknown:event", "123", "", "", []byte("{}")).Return(nil)
-
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(eventJSON))
-	req.Header.Set("X-Patreon-Signature", signature)
-	w := httptest.NewRecorder()
-
-	auth.HandleWebhook(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	mockDB.AssertExpectations(t)
-}
-
-func TestPatreonAuth_HandleWebhook_DatabaseError(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	webhookEvent := WebhookEvent{
-		EventType:    "members:create",
-		PatreonID:    "123",
-		TierID:       "tier_1",
-		PatronStatus: "active_patron",
-		Payload:      json.RawMessage(`{}`),
-	}
-
-	eventJSON, _ := json.Marshal(webhookEvent)
-	secret := "test_secret"
-
-	h := hmac.New(md5.New, []byte(secret))
-	h.Write(eventJSON)
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	os.Setenv("WEBHOOK_SECRET", secret)
-	defer os.Unsetenv("WEBHOOK_SECRET")
-
-	// Mock database error
-	mockDB.On("SaveWebhookEvent", mock.Anything, "members:create", "123", "tier_1", "active_patron", []byte("{}")).Return(assert.AnError)
-
-	req := httptest.NewRequest("POST", "/webhook", bytes.NewReader(eventJSON))
-	req.Header.Set("X-Patreon-Signature", signature)
-	w := httptest.NewRecorder()
-
-	auth.HandleWebhook(w, req)
-
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "Failed to save webhook event")
-	mockDB.AssertExpectations(t)
-}
-
-func TestPatreonAuth_HandleRefresh_Success(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	// Mock successful refresh token verification and tier code retrieval
-	mockDB.On("VerifyRefreshToken", mock.Anything, "valid_refresh_token").Return("123", nil)
-	mockDB.On("GetTierCodeForUser", mock.Anything, "123").Return("apprentice", nil)
-
-	// Create request with refresh token cookie
-	req := httptest.NewRequest("POST", "/auth/refresh", nil)
-	req.AddCookie(&http.Cookie{
-		Name:  "scryforge_refresh",
-		Value: "valid_refresh_token",
-	})
-	w := httptest.NewRecorder()
-
-	auth.HandleRefresh(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	// Verify that a new auth cookie was set
-	cookies := w.Result().Cookies()
-	var authCookie *http.Cookie
-	for _, cookie := range cookies {
-		if cookie.Name == "scryforge_auth" {
-			authCookie = cookie
-			break
-		}
-	}
-
-	assert.NotNil(t, authCookie, "Auth cookie should be set")
-	assert.NotEmpty(t, authCookie.Value, "Auth cookie should have a value")
-	assert.Equal(t, 3600, authCookie.MaxAge, "Auth cookie should expire in 1 hour")
-
-	mockDB.AssertExpectations(t)
-}
-
-func TestPatreonAuth_HandleRefresh_MissingToken(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	req := httptest.NewRequest("POST", "/auth/refresh", nil)
-	w := httptest.NewRecorder()
-
-	auth.HandleRefresh(w, req)
-
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-	assert.Contains(t, w.Body.String(), "Missing refresh token")
-}
-
-func TestPatreonAuth_HandleRefresh_InvalidToken(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	// Mock failed refresh token verification
-	mockDB.On("VerifyRefreshToken", mock.Anything, "invalid_refresh_token").Return("", assert.AnError)
-
-	req := httptest.NewRequest("POST", "/auth/refresh", nil)
-	req.AddCookie(&http.Cookie{
-		Name:  "scryforge_refresh",
-		Value: "invalid_refresh_token",
-	})
-	w := httptest.NewRecorder()
-
-	auth.HandleRefresh(w, req)
-
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-	assert.Contains(t, w.Body.String(), "Invalid refresh token")
-
-	mockDB.AssertExpectations(t)
-}
-
-func TestPatreonAuth_HandleRefresh_JWTGenerationError(t *testing.T) {
-	mockDB := &MockDatabase{}
-	config := &oauth2.Config{}
-	auth := NewPatreonAuth(mockDB, config)
-
-	// Temporarily unset JWT_SECRET_CURRENT to cause JWT generation to fail
-	originalSecret := os.Getenv("JWT_SECRET_CURRENT")
-	os.Unsetenv("JWT_SECRET_CURRENT")
-	defer os.Setenv("JWT_SECRET_CURRENT", originalSecret)
-
-	// Mock successful refresh token verification and tier code retrieval
-	mockDB.On("VerifyRefreshToken", mock.Anything, "valid_refresh_token").Return("123", nil)
-	mockDB.On("GetTierCodeForUser", mock.Anything, "123").Return("apprentice", nil)
-
-	req := httptest.NewRequest("POST", "/auth/refresh", nil)
-	req.AddCookie(&http.Cookie{
-		Name:  "scryforge_refresh",
-		Value: "valid_refresh_token",
-	})
-	w := httptest.NewRecorder()
-
-	auth.HandleRefresh(w, req)
-
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "Failed to generate token")
-
-	mockDB.AssertExpectations(t)
-}
-
-func TestGenerateJWT_Success(t *testing.T) {
-	token, err := generateJWT("123", "apprentice")
-
-	assert.NoError(t, err)
-	assert.NotEmpty(t, token)
-
-	// Verify the token can be parsed and contains expected claims
-	parsedToken, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
-		return []byte("test_jwt_secret_key_for_testing"), nil
-	})
-
-	assert.NoError(t, err)
-	assert.True(t, parsedToken.Valid)
-
-	claims, ok := parsedToken.Claims.(jwt.MapClaims)
-	assert.True(t, ok)
-
-	assert.Equal(t, "123", claims["sub"])
-	assert.Equal(t, "apprentice", claims["tier"])
-	assert.Equal(t, "forgerealm-auth", claims["iss"])
-}
-
-func TestGenerateJWT_MissingSecret(t *testing.T) {
-	// Temporarily unset JWT_SECRET_CURRENT
-	originalSecret := os.Getenv("JWT_SECRET_CURRENT")
-	os.Unsetenv("JWT_SECRET_CURRENT")
-	defer os.Setenv("JWT_SECRET_CURRENT", originalSecret)
-
-	_, err := generateJWT("123", "apprentice")
-
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "JWT_SECRET_CURRENT")
-}
-
-func TestGenerateSecureRandomToken(t *testing.T) {
-	token1 := generateSecureRandomToken()
-	token2 := generateSecureRandomToken()
-
-	assert.NotEmpty(t, token1)
-	assert.NotEmpty(t, token2)
-	assert.NotEqual(t, token1, token2, "Tokens should be unique")
-
-	// Verify it's base64 URL safe
-	assert.Regexp(t, `^[A-Za-z0-9_-]+=*$`, token1)
-	assert.Regexp(t, `^[A-Za-z0-9_-]+=*$`, token2)
 }

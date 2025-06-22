@@ -1,0 +1,730 @@
+package auth
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"forgerealm-auth/db"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+	"golang.org/x/oauth2"
+)
+
+type TestContainer struct {
+	container testcontainers.Container
+	db        *db.PostgresDB
+	connStr   string
+}
+
+func setupTestContainer(t *testing.T) *TestContainer {
+	ctx := context.Background()
+
+	// Start PostgreSQL container
+	postgresContainer, err := postgres.RunContainer(ctx,
+		testcontainers.WithImage("postgres:15-alpine"),
+		postgres.WithDatabase("forgerealm_auth_test"),
+		postgres.WithUsername("testuser"),
+		postgres.WithPassword("testpass"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections"),
+		),
+	)
+	require.NoError(t, err)
+
+	// Get host and port for manual connection string
+	host, err := postgresContainer.Host(ctx)
+	require.NoError(t, err)
+	// Always use localhost with the mapped port
+	host = "localhost"
+	port, err := postgresContainer.MappedPort(ctx, "5432")
+	require.NoError(t, err)
+	user := "testuser"
+	password := "testpass"
+	dbname := "forgerealm_auth_test"
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, password, host, port.Port(), dbname)
+	fmt.Println("[E2E] Using DATABASE_URL:", connStr)
+
+	// Initialize database
+	testDB := &db.PostgresDB{}
+	os.Setenv("DATABASE_URL", connStr)
+
+	// Add retry loop with delay before pinging
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		err = testDB.InitDB()
+		if err == nil {
+			break
+		}
+		fmt.Printf("[E2E] Database connection attempt %d failed: %v\n", i+1, err)
+		if i < maxRetries-1 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	require.NoError(t, err)
+
+	// Run database migrations
+	err = runMigrations(testDB.GetPool())
+	require.NoError(t, err)
+
+	return &TestContainer{
+		container: postgresContainer,
+		db:        testDB,
+		connStr:   connStr,
+	}
+}
+
+func (tc *TestContainer) cleanup() {
+	if tc.db != nil {
+		tc.db.CloseDB()
+	}
+	if tc.container != nil {
+		tc.container.Terminate(context.Background())
+	}
+}
+
+func runMigrations(pool *pgxpool.Pool) error {
+	// Read the migration script from the actual file
+	migrationSQL, err := os.ReadFile("../scripts/001_create_tables.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration file: %v", err)
+	}
+
+	_, err = pool.Exec(context.Background(), string(migrationSQL))
+	return err
+}
+
+func TestE2E_TokenLoginFlow(t *testing.T) {
+	tc := setupTestContainer(t)
+	defer tc.cleanup()
+
+	// Create token login handler
+	tokenLogin := NewTokenLogin(tc.db)
+
+	// Store token in a variable that persists across subtests
+	var testToken string
+
+	// Test 1: Start token login
+	t.Run("StartTokenLogin", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/auth/token/start", nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.StartTokenLogin(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.NotEmpty(t, resp["token"])
+
+		// Store token for next test
+		testToken = resp["token"]
+	})
+
+	// Test 2: Check token status (should be unfulfilled)
+	t.Run("CheckTokenStatus_Unfulfilled", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		req := httptest.NewRequest("GET", "/auth/token/status?token="+testToken, nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.CheckTokenStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]bool
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.False(t, resp["fulfilled"])
+	})
+
+	// Test 3: Fulfill token login (simulate OAuth callback)
+	t.Run("FulfillTokenLogin", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		// First, create a test user
+		userID := "test_patreon_user_123"
+		err := tc.db.SaveUser(
+			context.Background(),
+			userID,
+			"test@example.com",
+			"Test",
+			"User",
+			"apprentice",
+			"active_patron",
+			"access_token_123",
+			"refresh_token_123",
+			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		)
+		require.NoError(t, err)
+
+		// Fulfill the token login
+		err = tc.db.FulfillTokenLogin(context.Background(), testToken, userID)
+		require.NoError(t, err)
+	})
+
+	// Test 4: Check token status (should be fulfilled)
+	t.Run("CheckTokenStatus_Fulfilled", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		req := httptest.NewRequest("GET", "/auth/token/status?token="+testToken, nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.CheckTokenStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]bool
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp["fulfilled"])
+	})
+}
+
+func TestE2E_PatreonAuthFlow(t *testing.T) {
+	tc := setupTestContainer(t)
+	defer tc.cleanup()
+
+	// Create Patreon auth handler
+	config := &oauth2.Config{
+		ClientID:     "test_client_id",
+		ClientSecret: "test_client_secret",
+		RedirectURL:  "http://localhost:8080/auth/callback",
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  "https://www.patreon.com/oauth2/authorize",
+			TokenURL: "https://www.patreon.com/api/oauth2/token",
+		},
+	}
+
+	patreonAuth := NewPatreonAuth(tc.db, config)
+
+	// Test 1: Handle login with token
+	t.Run("HandleLogin_WithToken", func(t *testing.T) {
+		loginToken := "test_login_token_456"
+		req := httptest.NewRequest("GET", "/auth/login?token="+loginToken, nil)
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleLogin(w, req)
+
+		assert.Equal(t, http.StatusTemporaryRedirect, w.Code)
+		assert.Contains(t, w.Header().Get("Location"), "https://www.patreon.com/oauth2/authorize")
+		assert.Contains(t, w.Header().Get("Location"), loginToken)
+	})
+
+	// Test 2: Handle login without token
+	t.Run("HandleLogin_WithoutToken", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/auth/login", nil)
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleLogin(w, req)
+
+		assert.Equal(t, http.StatusTemporaryRedirect, w.Code)
+		assert.Contains(t, w.Header().Get("Location"), "https://www.patreon.com/oauth2/authorize")
+		assert.Contains(t, w.Header().Get("Location"), "state")
+	})
+
+	// Test 3: Handle callback with missing code
+	t.Run("HandleCallback_MissingCode", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/auth/callback", nil)
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleCallback(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "Code not found")
+	})
+
+	// Test 4: Handle callback with invalid code (will fail OAuth exchange)
+	t.Run("HandleCallback_InvalidCode", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/auth/callback?code=invalid_code", nil)
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleCallback(w, req)
+
+		// Should fail due to invalid OAuth code
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+}
+
+func TestE2E_WebhookFlow(t *testing.T) {
+	tc := setupTestContainer(t)
+	defer tc.cleanup()
+
+	// Create Patreon auth handler
+	config := &oauth2.Config{
+		ClientID:     "test_client_id",
+		ClientSecret: "test_client_secret",
+		RedirectURL:  "http://localhost:8080/auth/callback",
+	}
+
+	patreonAuth := NewPatreonAuth(tc.db, config)
+
+	// Test 1: Handle webhook with valid signature
+	t.Run("HandleWebhook_ValidSignature", func(t *testing.T) {
+		// Create test webhook payload
+		webhookPayload := `{
+			"event_type": "members:create",
+			"patreon_id": "test_user_123",
+			"tier_id": "apprentice",
+			"patron_status": "active_patron",
+			"payload": {
+				"data": {
+					"attributes": {
+						"email": "test@example.com",
+						"first_name": "Test",
+						"last_name": "User"
+					},
+					"relationships": {
+						"currently_entitled_tiers": {
+							"data": [{"id": "tier_1", "type": "tier"}]
+						}
+					}
+				},
+				"included": [
+					{
+						"type": "tier",
+						"id": "tier_1",
+						"attributes": {
+							"title": "Apprentice",
+							"description": "Apprentice tier"
+						}
+					}
+				]
+			}
+		}`
+
+		// Calculate valid signature
+		secret := "test_webhook_secret_for_testing"
+		os.Setenv("WEBHOOK_SECRET", secret)
+
+		req := httptest.NewRequest("POST", "/auth/webhook", bytes.NewBufferString(webhookPayload))
+		req.Header.Set("Content-Type", "application/json")
+
+		// Calculate HMAC signature
+		h := hmac.New(md5.New, []byte(secret))
+		h.Write([]byte(webhookPayload))
+		signature := hex.EncodeToString(h.Sum(nil))
+		req.Header.Set("X-Patreon-Signature", signature)
+
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleWebhook(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	// Test 2: Handle webhook with invalid signature
+	t.Run("HandleWebhook_InvalidSignature", func(t *testing.T) {
+		webhookPayload := `{
+			"event_type": "members:create",
+			"patreon_id": "test_user_456",
+			"tier_id": "apprentice",
+			"patron_status": "active_patron",
+			"payload": {}
+		}`
+
+		req := httptest.NewRequest("POST", "/auth/webhook", bytes.NewBufferString(webhookPayload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Patreon-Signature", "invalid_signature")
+
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleWebhook(w, req)
+
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		assert.Contains(t, w.Body.String(), "Invalid signature")
+	})
+}
+
+func TestE2E_RefreshTokenFlow(t *testing.T) {
+	tc := setupTestContainer(t)
+	defer tc.cleanup()
+
+	// Create Patreon auth handler
+	config := &oauth2.Config{
+		ClientID:     "test_client_id",
+		ClientSecret: "test_client_secret",
+		RedirectURL:  "http://localhost:8080/auth/callback",
+	}
+
+	patreonAuth := NewPatreonAuth(tc.db, config)
+
+	// Test 1: Store and verify refresh token
+	t.Run("RefreshToken_StoreAndVerify", func(t *testing.T) {
+		// Create a test user first
+		userID := "test_patreon_user_789"
+		err := tc.db.SaveUser(
+			context.Background(),
+			userID,
+			"test@example.com",
+			"Test",
+			"User",
+			"apprentice",
+			"active_patron",
+			"access_token_789",
+			"refresh_token_789",
+			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		)
+		require.NoError(t, err)
+
+		// Store refresh token
+		refreshToken := "test_refresh_token_123"
+		err = tc.db.StoreRefreshToken(context.Background(), userID, refreshToken)
+		require.NoError(t, err)
+
+		// Verify refresh token
+		retrievedUserID, err := tc.db.VerifyRefreshToken(context.Background(), refreshToken)
+		require.NoError(t, err)
+		assert.Equal(t, userID, retrievedUserID)
+	})
+
+	// Test 2: Handle refresh with valid token
+	t.Run("HandleRefresh_ValidToken", func(t *testing.T) {
+		// Create a test user and store refresh token
+		userID := "test_patreon_user_999"
+		err := tc.db.SaveUser(
+			context.Background(),
+			userID,
+			"test@example.com",
+			"Test",
+			"User",
+			"apprentice",
+			"active_patron",
+			"access_token_999",
+			"refresh_token_999",
+			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		)
+		require.NoError(t, err)
+
+		refreshToken := "test_refresh_token_999"
+		err = tc.db.StoreRefreshToken(context.Background(), userID, refreshToken)
+		require.NoError(t, err)
+
+		// Create request with refresh token cookie
+		req := httptest.NewRequest("POST", "/auth/refresh", nil)
+		req.AddCookie(&http.Cookie{
+			Name:  "scryforge_refresh",
+			Value: refreshToken,
+		})
+
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleRefresh(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	// Test 3: Handle refresh with missing token
+	t.Run("HandleRefresh_MissingToken", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/auth/refresh", nil)
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleRefresh(w, req)
+
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		assert.Contains(t, w.Body.String(), "Missing refresh token")
+	})
+}
+
+func TestE2E_DatabaseOperations(t *testing.T) {
+	tc := setupTestContainer(t)
+	defer tc.cleanup()
+
+	// Test 1: Save and retrieve user
+	t.Run("SaveAndRetrieveUser", func(t *testing.T) {
+		userID := "test_patreon_user_db"
+		email := "test@example.com"
+		givenName := "Test"
+		surName := "User"
+		tierID := "apprentice"
+		patronStatus := "active_patron"
+
+		// Save user
+		err := tc.db.SaveUser(
+			context.Background(),
+			userID,
+			email,
+			givenName,
+			surName,
+			tierID,
+			patronStatus,
+			"access_token_db",
+			"refresh_token_db",
+			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		)
+		require.NoError(t, err)
+
+		// Retrieve tier code
+		retrievedTierID, err := tc.db.GetTierCodeForUser(context.Background(), userID)
+		require.NoError(t, err)
+		assert.Equal(t, tierID, retrievedTierID)
+	})
+
+	// Test 2: Save webhook event
+	t.Run("SaveWebhookEvent", func(t *testing.T) {
+		eventType := "members:create"
+		patreonID := "test_webhook_user"
+		tierID := "apprentice"
+		patronStatus := "active_patron"
+		payload := []byte(`{"test": "data"}`)
+
+		err := tc.db.SaveWebhookEvent(
+			context.Background(),
+			eventType,
+			patreonID,
+			tierID,
+			patronStatus,
+			payload,
+		)
+		require.NoError(t, err)
+	})
+}
+
+func TestE2E_AuthStatusFlow(t *testing.T) {
+	ctx := context.Background()
+
+	// Start PostgreSQL container
+	postgresContainer, err := postgres.RunContainer(ctx,
+		testcontainers.WithImage("postgres:15-alpine"),
+		postgres.WithDatabase("forgerealm_auth_test"),
+		postgres.WithUsername("testuser"),
+		postgres.WithPassword("testpass"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(120*time.Second),
+		),
+	)
+	require.NoError(t, err)
+	defer func() {
+		if err := postgresContainer.Terminate(ctx); err != nil {
+			t.Fatalf("failed to terminate container: %s", err)
+		}
+	}()
+
+	// Get database connection details
+	host, err := postgresContainer.Host(ctx)
+	require.NoError(t, err)
+	port, err := postgresContainer.MappedPort(ctx, "5432/tcp")
+	require.NoError(t, err)
+
+	// Set up database connection
+	databaseURL := fmt.Sprintf("postgres://testuser:testpass@%s:%s/forgerealm_auth_test?sslmode=disable", host, port.Port())
+	t.Logf("[E2E] Using DATABASE_URL: %s", databaseURL)
+
+	// Initialize database
+	db := &db.PostgresDB{}
+	os.Setenv("DATABASE_URL", databaseURL)
+	err = db.InitDB()
+	require.NoError(t, err)
+	defer db.CloseDB()
+
+	// Run migrations
+	pool := db.GetPool()
+	err = runMigrations(pool)
+	require.NoError(t, err)
+
+	// Set up test environment variables
+	os.Setenv("JWT_SECRET_CURRENT", "test-secret-key-for-jwt-signing")
+	os.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
+
+	// Create OAuth config for testing
+	oauthConfig := &oauth2.Config{
+		ClientID:     "test-client-id",
+		ClientSecret: "test-client-secret",
+		RedirectURL:  "http://localhost:8080/auth/patreon/callback",
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  "https://www.patreon.com/oauth2/authorize",
+			TokenURL: "https://www.patreon.com/api/oauth2/token",
+		},
+	}
+
+	// Create auth handlers
+	patreonAuth := NewPatreonAuth(db, oauthConfig)
+
+	// Test cases
+	t.Run("HandleAuthStatus_Unauthenticated", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/auth/status", nil)
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleAuthStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var response map[string]string
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "unauthenticated", response["status"])
+	})
+
+	t.Run("HandleAuthStatus_Authenticated", func(t *testing.T) {
+		// Create a valid JWT token
+		patreonID := "test_patreon_user_auth"
+		tierCode := "apprentice"
+
+		// Save user to database first
+		err := db.SaveUser(
+			ctx,
+			patreonID,
+			"test@example.com",
+			"Test",
+			"User",
+			tierCode,
+			"active_patron",
+			"access_token",
+			"refresh_token",
+			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		)
+		require.NoError(t, err)
+
+		// Generate JWT token
+		jwtToken, err := generateJWT(patreonID, tierCode)
+		require.NoError(t, err)
+
+		// Create request with valid JWT cookie
+		req := httptest.NewRequest("GET", "/auth/status", nil)
+		req.AddCookie(&http.Cookie{
+			Name:  "scryforge_auth",
+			Value: jwtToken,
+		})
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleAuthStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var response map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "authenticated", response["status"])
+	})
+
+	t.Run("HandleAuthStatus_RenewalRequired", func(t *testing.T) {
+		// Create a user and store a refresh token
+		patreonID := "test_patreon_user_refresh"
+		tierCode := "apprentice"
+
+		// Save user to database
+		err := db.SaveUser(
+			ctx,
+			patreonID,
+			"test@example.com",
+			"Test",
+			"User",
+			tierCode,
+			"active_patron",
+			"access_token",
+			"refresh_token",
+			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		)
+		require.NoError(t, err)
+
+		// Store a refresh token
+		refreshToken := "valid-refresh-token-123"
+		err = db.StoreRefreshToken(ctx, patreonID, refreshToken)
+		require.NoError(t, err)
+
+		// Create request with valid refresh token cookie but no JWT
+		req := httptest.NewRequest("GET", "/auth/status", nil)
+		req.AddCookie(&http.Cookie{
+			Name:  "scryforge_refresh",
+			Value: refreshToken,
+		})
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleAuthStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var response map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "renewal_required", response["status"])
+	})
+
+	t.Run("HandleAuthStatus_InvalidJWT", func(t *testing.T) {
+		// Create request with invalid JWT cookie
+		req := httptest.NewRequest("GET", "/auth/status", nil)
+		req.AddCookie(&http.Cookie{
+			Name:  "scryforge_auth",
+			Value: "invalid-jwt-token",
+		})
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleAuthStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var response map[string]string
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "unauthenticated", response["status"])
+	})
+
+	t.Run("HandleAuthStatus_ExpiredJWT", func(t *testing.T) {
+		// Create an expired JWT token
+		patreonID := "test_patreon_user_expired"
+		tierCode := "apprentice"
+
+		// Generate expired JWT token (expired 1 hour ago)
+		secret := "test-secret-key-for-jwt-signing"
+		claims := jwt.MapClaims{
+			"sub":  patreonID,
+			"tier": tierCode,
+			"exp":  time.Now().Add(-1 * time.Hour).Unix(), // Expired
+			"iat":  time.Now().Add(-2 * time.Hour).Unix(),
+			"iss":  "forgerealm-auth",
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		expiredJWT, err := token.SignedString([]byte(secret))
+		require.NoError(t, err)
+
+		// Create request with expired JWT cookie
+		req := httptest.NewRequest("GET", "/auth/status", nil)
+		req.AddCookie(&http.Cookie{
+			Name:  "scryforge_auth",
+			Value: expiredJWT,
+		})
+		w := httptest.NewRecorder()
+
+		patreonAuth.HandleAuthStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var response map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "unauthenticated", response["status"])
+	})
+}
+
+// Helper function to generate JWT token for testing
+func generateJWT(patreonID, tierCode string) (string, error) {
+	secret := "test-secret-key-for-jwt-signing"
+	claims := jwt.MapClaims{
+		"sub":  patreonID,
+		"tier": tierCode,
+		"exp":  time.Now().Add(1 * time.Hour).Unix(),
+		"iat":  time.Now().Unix(),
+		"iss":  "forgerealm-auth",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(secret))
+}

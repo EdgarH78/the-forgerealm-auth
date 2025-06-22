@@ -65,6 +65,9 @@ func main() {
 	patreonAuth := auth.NewPatreonAuth(&db, patreonOAuthConfig)
 	log.Printf("INFO: Initialized Patreon authentication handler")
 
+	tokenLogin := auth.NewTokenLogin(&db)
+	log.Printf("INFO: Initialized token login handler")
+
 	// Routes
 	r.Get("/", handleHome)
 	r.Get("/healthz", handleHealthz)
@@ -72,6 +75,9 @@ func main() {
 	r.Get("/auth/callback", patreonAuth.HandleCallback)
 	r.Post("/auth/webhook", patreonAuth.HandleWebhook)
 	r.Post("/auth/refresh", patreonAuth.HandleRefresh)
+	r.Get("/auth/status", patreonAuth.HandleAuthStatus)
+	r.Post("/auth/token/start", tokenLogin.StartTokenLogin)
+	r.Get("/auth/token/status", tokenLogin.CheckTokenStatus)
 	log.Printf("INFO: Registered HTTP routes")
 
 	// Server setup

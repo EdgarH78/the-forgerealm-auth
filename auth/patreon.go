@@ -98,7 +98,7 @@ func (a *PatreonAuth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	url := a.patreonOAuthConfig.AuthCodeURL("state", oauth2.AccessTypeOffline)
 	if token != "" {
-		url = a.patreonOAuthConfig.AuthCodeURL(token)
+		url = a.patreonOAuthConfig.AuthCodeURL(token, oauth2.AccessTypeOffline)
 	}
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }

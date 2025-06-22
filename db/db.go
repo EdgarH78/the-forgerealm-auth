@@ -185,7 +185,7 @@ func (db *PostgresDB) SaveTokenLogin(ctx context.Context, token string, expiresA
 
 func (db *PostgresDB) CheckTokenLogin(ctx context.Context, token string) (bool, error) {
 	var fulfilled bool
-	err := db.pool.QueryRow(context.Background(),
+	err := db.pool.QueryRow(ctx,
 		`SELECT fulfilled FROM forgerealm_auth.token_logins WHERE token = $1 AND expires_at > now()`,
 		token,
 	).Scan(&fulfilled)

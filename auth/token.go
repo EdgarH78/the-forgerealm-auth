@@ -29,7 +29,7 @@ func (t *TokenLogin) StartTokenLogin(w http.ResponseWriter, r *http.Request) {
 	token := uuid.New().String()
 	expiry := time.Now().Add(10 * time.Minute)
 
-	err := t.db.SaveTokenLogin(context.Background(), token, expiry)
+	err := t.db.SaveTokenLogin(r.Context(), token, expiry)
 	if err != nil {
 		http.Error(w, "Failed to create login token", http.StatusInternalServerError)
 		return
@@ -46,7 +46,7 @@ func (t *TokenLogin) CheckTokenStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fulfilled, err := t.db.CheckTokenLogin(context.Background(), token)
+	fulfilled, err := t.db.CheckTokenLogin(r.Context(), token)
 	if err != nil {
 		http.Error(w, "Invalid or expired token", http.StatusNotFound)
 		return

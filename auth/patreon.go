@@ -330,8 +330,18 @@ func (a *PatreonAuth) HandleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	authCookie, err := r.Cookie("scryforge_auth")
 	if err == nil {
 		// Try parsing the JWT
-		secret := os.Getenv("JWT_SECRET_CURRENT")
+		secret := strings.TrimSpace(os.Getenv("JWT_SECRET_CURRENT"))
+		if secret == "" {
+			log.Printf("ERROR: JWT_SECRET_CURRENT environment variable is not set")
+			http.Error(w, "Authentication service unavailable", http.StatusInternalServerError)
+			return
+		}
+
 		token, err := jwt.Parse(authCookie.Value, func(t *jwt.Token) (interface{}, error) {
+			// Validate the signing method to prevent algorithm confusion attacks
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
 			return []byte(secret), nil
 		})
 		if err == nil && token.Valid {

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,14 +14,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-type Database interface {
-	SaveUser(ctx context.Context, patreonID, email, givenName, surName, tierID, patronStatus, accessToken, refreshToken string, tokenExpiry pgtype.Timestamp) error
-	SaveWebhookEvent(ctx context.Context, eventTypeID, patreonID, tierID, patronStatus string, rawPayload []byte) error
-	VerifyRefreshToken(ctx context.Context, token string) (string, error)
-	StoreRefreshToken(ctx context.Context, patreonID, token string) error
-	GetTierCodeForUser(ctx context.Context, patreonID string) (string, error)
-}
 
 type PostgresDB struct {
 	pool *pgxpool.Pool
@@ -172,6 +165,54 @@ func (db *PostgresDB) GetTierCodeForUser(ctx context.Context, patreonID string) 
 
 	log.Printf("INFO: Successfully retrieved tier code '%s' for Patreon ID: %s", tierID, patreonID)
 	return tierID, nil
+}
+
+func (db *PostgresDB) SaveTokenLogin(ctx context.Context, token string, expiresAt time.Time) error {
+	query := `
+		INSERT INTO forgerealm_auth.token_logins (token, expires_at)
+		VALUES ($1, $2)
+	`
+
+	_, err := db.pool.Exec(ctx, query, token, expiresAt)
+	if err != nil {
+		log.Printf("ERROR: Failed to save token login: %v", err)
+		return err
+	}
+
+	log.Printf("INFO: Successfully saved token login for token: %s", token)
+	return nil
+}
+
+func (db *PostgresDB) CheckTokenLogin(ctx context.Context, token string) (bool, error) {
+	var fulfilled bool
+	err := db.pool.QueryRow(context.Background(),
+		`SELECT fulfilled FROM forgerealm_auth.token_logins WHERE token = $1 AND expires_at > now()`,
+		token,
+	).Scan(&fulfilled)
+	if err != nil {
+		log.Printf("ERROR: Failed to check token login: %v", err)
+		return false, err
+	}
+	log.Printf("INFO: Successfully checked token login for token: %s", token)
+	return fulfilled, nil
+}
+
+func (db *PostgresDB) FulfillTokenLogin(ctx context.Context, token string, userID string) error {
+	query := `
+		UPDATE forgerealm_auth.token_logins
+		SET fulfilled = true, user_id = (
+			SELECT id FROM forgerealm_auth.users WHERE patreon_id = $2
+		)
+		WHERE token = $1 AND fulfilled = false
+	`
+	_, err := db.pool.Exec(ctx, query, token, userID)
+	if err != nil {
+		log.Printf("ERROR: Failed to fulfill token login: %v", err)
+		return err
+	}
+
+	log.Printf("INFO: Successfully fulfilled token login for token: %s", token)
+	return nil
 }
 
 func hashToken(token string) string {

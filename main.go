@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
 	"golang.org/x/oauth2"
 )
@@ -56,6 +57,14 @@ func main() {
 	// Initialize router
 	log.Printf("INFO: Setting up HTTP router and middleware")
 	r := chi.NewRouter()
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:30000", "https://foundry.theforgerealm.com"}, // Add your dev + prod clients
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		ExposedHeaders:   []string{"Set-Cookie"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
 
 	// Middleware
 	r.Use(middleware.Logger)

@@ -208,17 +208,16 @@ func (a *TestPatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request)
 	firstName := result.Data.Attributes.FirstName
 	lastName := result.Data.Attributes.LastName
 
-	// Assume non-patron by default
-	tierTitle := "non_patron"
-	patronStatus := "non_patron"
-
+	// Check if user is an active patron
 	if len(result.Included) > 0 && result.Included[0].Attributes.PatronStatus == "active_patron" {
-		tierTitle = "apprentice"
-		patronStatus = "active_patron"
+		// User is an active patron, proceed with authentication
 	} else {
 		http.Error(w, "You must be a patron to access this feature.", http.StatusForbidden)
 		return
 	}
+
+	tierTitle := "apprentice" // Default tier for active patrons
+	patronStatus := "active_patron"
 
 	tokenExpiresAt := defaultExpiry(24)
 	err = a.db.SaveUser(
@@ -285,7 +284,9 @@ func (a *TestPatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request)
 	log.Printf("INFO: Successfully authenticated Patreon user ID: %s", userID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok","message":"authenticated"}`))
+	if _, err := w.Write([]byte(`{"status":"ok","message":"authenticated"}`)); err != nil {
+		log.Printf("ERROR: Failed to write response: %v", err)
+	}
 }
 
 // TestHandleCallback_CompleteFlow tests the complete HandleCallback flow with mocked dependencies
@@ -352,7 +353,7 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 			},
 			mockDB:         &MockDatabase{},
 			expectedStatus: http.StatusOK,
-			expectedBody:   `{"status":"ok","message":"authenticated"}`,
+			expectedBody:   `"status":"ok"`,
 			checkCookies:   true,
 		},
 		{
@@ -405,7 +406,7 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 			},
 			mockDB:         &MockDatabase{},
 			expectedStatus: http.StatusOK,
-			expectedBody:   `{"status":"ok","message":"authenticated"}`,
+			expectedBody:   `"status":"ok"`,
 			checkCookies:   true,
 		},
 		{
@@ -736,42 +737,26 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 				t.Errorf("expected body to contain '%s', got '%s'", tt.expectedBody, w.Body.String())
 			}
 
-			// Check cookies if expected
+			// Check JSON response format if expected
 			if tt.checkCookies {
-				cookies := w.Result().Cookies()
-				authCookie := findCookie(cookies, "scryforge_auth")
-				refreshCookie := findCookie(cookies, "scryforge_refresh")
-
-				if authCookie == nil {
-					t.Error("expected scryforge_auth cookie to be set")
-				}
-				if refreshCookie == nil {
-					t.Error("expected scryforge_refresh cookie to be set")
+				var response map[string]interface{}
+				err := json.Unmarshal(w.Body.Bytes(), &response)
+				if err != nil {
+					t.Errorf("expected valid JSON response, got error: %v", err)
 				}
 
-				// Verify cookie properties
-				if authCookie != nil {
-					if authCookie.HttpOnly != true {
-						t.Error("expected scryforge_auth cookie to be HttpOnly")
-					}
-					if authCookie.Secure != true {
-						t.Error("expected scryforge_auth cookie to be Secure")
-					}
-					if authCookie.MaxAge != 3600 {
-						t.Errorf("expected scryforge_auth cookie MaxAge to be 3600, got %d", authCookie.MaxAge)
-					}
+				// Verify response structure
+				if response["status"] != "ok" {
+					t.Errorf("expected status 'ok', got '%v'", response["status"])
 				}
-
-				if refreshCookie != nil {
-					if refreshCookie.HttpOnly != true {
-						t.Error("expected scryforge_refresh cookie to be HttpOnly")
-					}
-					if refreshCookie.Secure != true {
-						t.Error("expected scryforge_refresh cookie to be Secure")
-					}
-					if refreshCookie.MaxAge != 30*24*3600 {
-						t.Errorf("expected scryforge_refresh cookie MaxAge to be %d, got %d", 30*24*3600, refreshCookie.MaxAge)
-					}
+				if response["message"] != "authenticated" {
+					t.Errorf("expected message 'authenticated', got '%v'", response["message"])
+				}
+				if response["token"] == nil || response["token"] == "" {
+					t.Error("expected token to be present in response")
+				}
+				if response["refresh_token"] == nil || response["refresh_token"] == "" {
+					t.Error("expected refresh_token to be present in response")
 				}
 			}
 
@@ -779,16 +764,6 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 			tt.mockDB.AssertExpectations(t)
 		})
 	}
-}
-
-// Helper function to find a cookie by name
-func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
-	for _, cookie := range cookies {
-		if cookie.Name == name {
-			return cookie
-		}
-	}
-	return nil
 }
 
 func TestNewPatreonAuth(t *testing.T) {

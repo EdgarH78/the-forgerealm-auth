@@ -34,7 +34,11 @@ func (t *TokenLogin) StartTokenLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to create login token", http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"token": token})
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{"token": token}); err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
 // GET /auth/token/status?token=...
@@ -52,5 +56,9 @@ func (t *TokenLogin) CheckTokenStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]bool{"fulfilled": fulfilled})
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]bool{"fulfilled": fulfilled}); err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }

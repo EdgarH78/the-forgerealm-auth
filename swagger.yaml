@@ -8,14 +8,16 @@ info:
     and webhook handling for Patreon membership events.
     
     ## Authentication
-    The service uses JWT tokens stored in HTTP-only cookies for session management.
-    Refresh tokens are also provided for token renewal.
+    The service uses JWT Bearer tokens for authentication. After successful OAuth login,
+    a JWT token and refresh token are returned in the response body. Include the JWT token
+    in the Authorization header as "Bearer <token>" for protected endpoints.
     
     ## Security
     - All endpoints use HTTPS
     - JWT tokens are signed with HMAC-SHA256
     - Webhook signatures are verified using HMAC-MD5
     - Tokens have appropriate expiration times
+    - Bearer tokens are used for API authentication
   version: 1.0.0
   contact:
     name: ForgeRealm Support
@@ -91,9 +93,9 @@ paths:
       summary: OAuth callback handler
       description: |
         Handles the OAuth callback from Patreon after successful authorization.
-        Processes the authorization code, retrieves user information, and sets
-        authentication cookies. If a state parameter contains a login token,
-        it will fulfill the token-based login.
+        Processes the authorization code, retrieves user information, and returns
+        JWT and refresh tokens in the response body. If a state parameter contains 
+        a login token, it will fulfill the token-based login.
       tags:
         - Authentication
       parameters:
@@ -115,14 +117,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: "ok"
-                  message:
-                    type: string
-                    example: "authenticated"
+                $ref: '#/components/schemas/AuthResponse'
         '400':
           description: Missing authorization code
           content:
@@ -149,23 +144,26 @@ paths:
     get:
       summary: Check authentication status
       description: |
-        Checks the current authentication status by validating JWT tokens
-        and refresh tokens from cookies. Returns the authentication state.
+        Checks the current authentication status by validating the JWT Bearer token
+        in the Authorization header. Returns the authentication state and user information.
       tags:
         - Authentication
+      security:
+        - BearerAuth: []
       responses:
         '200':
           description: Authentication status
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    enum: [authenticated, renewal_required, unauthenticated]
-                    description: Current authentication status
-                    example: "authenticated"
+                $ref: '#/components/schemas/AuthStatusResponse'
+        '401':
+          description: Invalid or missing Bearer token
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Unauthorized: missing Authorization header"
         '500':
           description: Authentication service unavailable
           content:
@@ -178,31 +176,38 @@ paths:
     post:
       summary: Refresh authentication token
       description: |
-        Refreshes the JWT token using a valid refresh token from cookies.
+        Refreshes the JWT token using a valid refresh token provided in the request body.
         Generates a new JWT token and refresh token.
       tags:
         - Authentication
+      requestBody:
+        description: Refresh token request
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
       responses:
         '200':
           description: Token refreshed successfully
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: "ok"
-                  message:
-                    type: string
-                    example: "token refreshed"
-        '401':
-          description: Missing or invalid refresh token
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Missing or invalid request body
           content:
             text/plain:
               schema:
                 type: string
                 example: "Missing refresh token"
+        '401':
+          description: Invalid refresh token
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Invalid refresh token"
         '500':
           description: Internal server error
           content:
@@ -378,9 +383,11 @@ components:
       properties:
         data:
           type: object
+          description: Member data structure
           properties:
             attributes:
               type: object
+              description: Member attributes
               properties:
                 email:
                   type: string
@@ -394,38 +401,186 @@ components:
                   example: "Doe"
                 patron_status:
                   type: string
+                  enum: [active_patron, declined_patron, former_patron, non_patron]
                   example: "active_patron"
             relationships:
               type: object
+              description: Member relationships
               properties:
                 currently_entitled_tiers:
                   type: object
+                  description: Currently entitled tiers
                   properties:
                     data:
                       type: array
+                      description: Array of entitled tier data
                       items:
                         type: object
                         properties:
                           id:
                             type: string
+                            description: Tier ID
+                            example: "98765432"
                           type:
                             type: string
+                            description: Tier type
+                            example: "tier"
         included:
           type: array
+          description: Included data from Patreon API
           items:
             type: object
             properties:
               type:
                 type: string
+                description: Type of included data
+                example: "tier"
               id:
                 type: string
+                description: ID of included data
+                example: "98765432"
               attributes:
                 type: object
+                description: Attributes of included data
                 properties:
                   title:
                     type: string
+                    description: Tier title
+                    example: "Apprentice"
                   description:
                     type: string
+                    description: Tier description
+                    example: "Basic patron tier"
+
+    AuthResponse:
+      type: object
+      description: Authentication response structure
+      properties:
+        status:
+          type: string
+          example: "ok"
+        message:
+          type: string
+          example: "authenticated"
+        token:
+          type: string
+          description: JWT token for authentication
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        refresh_token:
+          type: string
+          description: Refresh token for token renewal
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+
+    AuthStatusResponse:
+      type: object
+      description: Authentication status response structure
+      properties:
+        status:
+          type: string
+          enum: [authenticated, unauthenticated]
+          description: Current authentication status
+          example: "authenticated"
+        user_id:
+          type: string
+          description: User ID (only present when authenticated)
+          example: "12345678"
+        tier:
+          type: string
+          description: User tier level (only present when authenticated)
+          example: "apprentice"
+
+    RefreshTokenRequest:
+      type: object
+      description: Refresh token request structure
+      properties:
+        refresh_token:
+          type: string
+          description: Refresh token for authentication
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+
+    PatreonUserAttributes:
+      type: object
+      description: User attributes from Patreon API
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        first_name:
+          type: string
+          example: "John"
+        last_name:
+          type: string
+          example: "Doe"
+
+    PatreonMembershipData:
+      type: object
+      description: Membership data from Patreon API
+      properties:
+        id:
+          type: string
+          example: "membership_123"
+
+    PatreonMemberships:
+      type: object
+      description: Memberships relationship from Patreon API
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatreonMembershipData'
+
+    PatreonUserRelationships:
+      type: object
+      description: User relationships from Patreon API
+      properties:
+        memberships:
+          $ref: '#/components/schemas/PatreonMemberships'
+
+    PatreonUserData:
+      type: object
+      description: User data from Patreon API
+      properties:
+        id:
+          type: string
+          example: "12345678"
+        attributes:
+          $ref: '#/components/schemas/PatreonUserAttributes'
+        relationships:
+          $ref: '#/components/schemas/PatreonUserRelationships'
+
+    PatreonIncludedAttributes:
+      type: object
+      description: Included attributes from Patreon API
+      properties:
+        patron_status:
+          type: string
+          enum: [active_patron, declined_patron, former_patron, non_patron]
+          example: "active_patron"
+
+    PatreonIncluded:
+      type: object
+      description: Included data from Patreon API
+      properties:
+        type:
+          type: string
+          example: "member"
+        id:
+          type: string
+          example: "membership_123"
+        attributes:
+          $ref: '#/components/schemas/PatreonIncludedAttributes'
+
+    PatreonIdentityResponse:
+      type: object
+      description: Patreon identity API response
+      properties:
+        data:
+          $ref: '#/components/schemas/PatreonUserData'
+        included:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatreonIncluded'
 
   securitySchemes:
     PatreonWebhook:
@@ -433,6 +588,9 @@ components:
       name: X-Patreon-Signature
       in: header
       description: HMAC-MD5 signature of the webhook payload
+    BearerAuth:
+      type: http
+      scheme: bearer
 
   responses:
     UnauthorizedError:

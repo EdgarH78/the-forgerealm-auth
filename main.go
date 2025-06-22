@@ -114,7 +114,8 @@ func main() {
 		log.Printf("INFO: Received shutdown signal, starting graceful shutdown")
 
 		// Shutdown signal with grace period of 30 seconds
-		shutdownCtx, _ := context.WithTimeout(serverCtx, 30*time.Second)
+		shutdownCtx, shutdownCancel := context.WithTimeout(serverCtx, 30*time.Second)
+		defer shutdownCancel()
 
 		go func() {
 			<-shutdownCtx.Done()
@@ -147,9 +148,13 @@ func main() {
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Welcome to ForgeRealm Auth Service"))
+	if _, err := w.Write([]byte("Welcome to ForgeRealm Auth Service")); err != nil {
+		log.Printf("ERROR: Failed to write response: %v", err)
+	}
 }
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		log.Printf("ERROR: Failed to write response: %v", err)
+	}
 }

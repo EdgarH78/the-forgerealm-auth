@@ -11,7 +11,7 @@ import (
 
 type TokenDatabase interface {
 	SaveTokenLogin(ctx context.Context, token string, expiresAt time.Time) error
-	CheckTokenLogin(ctx context.Context, token string) (bool, error)
+	CheckTokenLogin(ctx context.Context, token string) (bool, string, error)
 }
 
 type TokenLogin struct {
@@ -41,8 +41,14 @@ func (t *TokenLogin) StartTokenLogin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// TokenStatusResponse represents the token status response
+type TokenStatusResponse struct {
+	Fulfilled bool   `json:"fulfilled"`
+	Token     string `json:"token,omitempty"`
+}
+
 // GET /auth/token/status?token=...
-// Response: { fulfilled: bool }
+// Response: { fulfilled: bool, token?: string }
 func (t *TokenLogin) CheckTokenStatus(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {
@@ -50,14 +56,28 @@ func (t *TokenLogin) CheckTokenStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fulfilled, err := t.db.CheckTokenLogin(r.Context(), token)
+	fulfilled, userID, err := t.db.CheckTokenLogin(r.Context(), token)
 	if err != nil {
 		http.Error(w, "Invalid or expired token", http.StatusNotFound)
 		return
 	}
 
+	response := TokenStatusResponse{
+		Fulfilled: fulfilled,
+	}
+
+	// If token is fulfilled, generate and return JWT token
+	if fulfilled && userID != "" {
+		jwtToken, err := generateJWT(userID, "apprentice") // Default tier, can be enhanced later
+		if err != nil {
+			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+			return
+		}
+		response.Token = jwtToken
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]bool{"fulfilled": fulfilled}); err != nil {
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}

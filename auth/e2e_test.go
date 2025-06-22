@@ -38,6 +38,7 @@ func setupTestContainer(t *testing.T) *TestContainer {
 	ctx := context.Background()
 
 	// Start PostgreSQL container
+	//nolint:staticcheck // SA1019: postgres.RunContainer is deprecated but the new API has different syntax
 	postgresContainer, err := postgres.RunContainer(ctx,
 		testcontainers.WithImage("postgres:15-alpine"),
 		postgres.WithDatabase("forgerealm_auth_test"),
@@ -50,16 +51,12 @@ func setupTestContainer(t *testing.T) *TestContainer {
 	require.NoError(t, err)
 
 	// Get host and port for manual connection string
-	host, err := postgresContainer.Host(ctx)
-	require.NoError(t, err)
-	// Always use localhost with the mapped port
-	host = "localhost"
 	port, err := postgresContainer.MappedPort(ctx, "5432")
 	require.NoError(t, err)
 	user := "testuser"
 	password := "testpass"
 	dbname := "forgerealm_auth_test"
-	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, password, host, port.Port(), dbname)
+	connStr := fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", user, password, port.Port(), dbname)
 	fmt.Println("[E2E] Using DATABASE_URL:", connStr)
 
 	// Initialize database
@@ -96,7 +93,9 @@ func (tc *TestContainer) cleanup() {
 		tc.db.CloseDB()
 	}
 	if tc.container != nil {
-		tc.container.Terminate(context.Background())
+		if err := tc.container.Terminate(context.Background()); err != nil {
+			fmt.Printf("WARN: Failed to terminate test container: %v\n", err)
+		}
 	}
 }
 
@@ -418,18 +417,26 @@ func TestE2E_RefreshTokenFlow(t *testing.T) {
 		err = tc.db.StoreRefreshToken(context.Background(), userID, refreshToken)
 		require.NoError(t, err)
 
-		// Create request with refresh token cookie
-		req := httptest.NewRequest("POST", "/auth/refresh", nil)
-		req.AddCookie(&http.Cookie{
-			Name:  "scryforge_refresh",
-			Value: refreshToken,
-		})
+		// Create request with refresh token in JSON body
+		requestBody := map[string]string{"refresh_token": refreshToken}
+		jsonBody, _ := json.Marshal(requestBody)
+		req := httptest.NewRequest("POST", "/auth/refresh", bytes.NewBuffer(jsonBody))
+		req.Header.Set("Content-Type", "application/json")
 
 		w := httptest.NewRecorder()
 
 		patreonAuth.HandleRefresh(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
+
+		// Verify response contains new token and refresh token
+		var response map[string]interface{}
+		err = json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "ok", response["status"])
+		assert.Equal(t, "token refreshed", response["message"])
+		assert.NotEmpty(t, response["token"])
+		assert.NotEmpty(t, response["refresh_token"])
 	})
 
 	// Test 3: Handle refresh with missing token
@@ -439,8 +446,8 @@ func TestE2E_RefreshTokenFlow(t *testing.T) {
 
 		patreonAuth.HandleRefresh(w, req)
 
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
-		assert.Contains(t, w.Body.String(), "Missing refresh token")
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "Invalid request body")
 	})
 }
 
@@ -511,12 +518,13 @@ func TestE2E_HandleAuthStatus(t *testing.T) {
 		ClientSecret: "test-client-secret",
 		RedirectURL:  "http://localhost:8080/auth/patreon/callback",
 	}
-	authHandler := NewPatreonAuth(tc.db, oauthConfig)
+
+	patreonAuth := NewPatreonAuth(tc.db, oauthConfig)
 
 	// Helper to call the handler
 	handle := func(req *http.Request) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
-		authHandler.HandleAuthStatus(w, req)
+		patreonAuth.HandleAuthStatus(w, req)
 		return w
 	}
 
@@ -542,49 +550,19 @@ func TestE2E_HandleAuthStatus(t *testing.T) {
 		require.NoError(t, err)
 
 		req := httptest.NewRequest("GET", "/auth/status", nil)
-		req.AddCookie(&http.Cookie{Name: "scryforge_auth", Value: jwtToken})
+		req.Header.Set("Authorization", "Bearer "+jwtToken)
 		w := handle(req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		var resp map[string]string
+		var resp map[string]interface{}
 		err = json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.NoError(t, err)
 		assert.Equal(t, "authenticated", resp["status"])
+		assert.Equal(t, patreonID, resp["user_id"])
+		assert.Equal(t, tier, resp["tier"])
 	})
 
-	t.Run("renewal_required with valid refresh token", func(t *testing.T) {
-		patreonID := "e2e_user_refresh"
-		tier := "apprentice"
-		// Save user
-		err := tc.db.SaveUser(
-			context.Background(),
-			patreonID,
-			"test@example.com",
-			"Test",
-			"User",
-			tier,
-			"active_patron",
-			"access_token",
-			"refresh_token",
-			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
-		)
-		require.NoError(t, err)
-		refreshToken := "refresh-e2e-token"
-		err = tc.db.StoreRefreshToken(context.Background(), patreonID, refreshToken)
-		require.NoError(t, err)
-
-		req := httptest.NewRequest("GET", "/auth/status", nil)
-		req.AddCookie(&http.Cookie{Name: "scryforge_refresh", Value: refreshToken})
-		w := handle(req)
-
-		assert.Equal(t, http.StatusOK, w.Code)
-		var resp map[string]string
-		err = json.Unmarshal(w.Body.Bytes(), &resp)
-		assert.NoError(t, err)
-		assert.Equal(t, "renewal_required", resp["status"])
-	})
-
-	t.Run("unauthenticated with no valid cookies", func(t *testing.T) {
+	t.Run("unauthenticated with no valid token", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/auth/status", nil)
 		w := handle(req)
 
@@ -706,12 +684,14 @@ func TestE2E_HandleCallback_WithRealDatabase(t *testing.T) {
 		assert.Equal(t, http.StatusOK, callbackW.Code)
 		assert.Contains(t, callbackW.Body.String(), `"status":"ok"`)
 
-		// Verify cookies were set
-		cookies := callbackW.Result().Cookies()
-		authCookie := findCookie(cookies, "scryforge_auth")
-		refreshCookie := findCookie(cookies, "scryforge_refresh")
-		assert.NotNil(t, authCookie, "Auth cookie should be set")
-		assert.NotNil(t, refreshCookie, "Refresh cookie should be set")
+		// Verify response contains token and refresh token
+		var response map[string]interface{}
+		err = json.Unmarshal(callbackW.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "ok", response["status"])
+		assert.Equal(t, "authenticated", response["message"])
+		assert.NotEmpty(t, response["token"])
+		assert.NotEmpty(t, response["refresh_token"])
 
 		// Verify token login was fulfilled in database
 		tokenStatusReq := httptest.NewRequest("GET", "/auth/token/status?token="+loginToken, nil)
@@ -740,12 +720,14 @@ func TestE2E_HandleCallback_WithRealDatabase(t *testing.T) {
 		assert.Equal(t, http.StatusOK, callbackW.Code)
 		assert.Contains(t, callbackW.Body.String(), `"status":"ok"`)
 
-		// Verify cookies were set
-		cookies := callbackW.Result().Cookies()
-		authCookie := findCookie(cookies, "scryforge_auth")
-		refreshCookie := findCookie(cookies, "scryforge_refresh")
-		assert.NotNil(t, authCookie, "Auth cookie should be set")
-		assert.NotNil(t, refreshCookie, "Refresh cookie should be set")
+		// Verify response contains token and refresh token
+		var response map[string]interface{}
+		err := json.Unmarshal(callbackW.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "ok", response["status"])
+		assert.Equal(t, "authenticated", response["message"])
+		assert.NotEmpty(t, response["token"])
+		assert.NotEmpty(t, response["refresh_token"])
 
 		// Verify user was saved to database
 		tierCode, err := tc.db.GetTierCodeForUser(context.Background(), "test_user_patron")
@@ -841,13 +823,16 @@ func TestE2E_HandleCallback_WithRealDatabase(t *testing.T) {
 
 		patreonAuth.HandleCallback(callbackW, callbackReq)
 
-		// Get the refresh token from cookies
-		cookies := callbackW.Result().Cookies()
-		refreshCookie := findCookie(cookies, "scryforge_refresh")
-		require.NotNil(t, refreshCookie, "Refresh cookie should be set")
+		// Get the refresh token from JSON response
+		var response map[string]interface{}
+		err := json.Unmarshal(callbackW.Body.Bytes(), &response)
+		require.NoError(t, err)
+		refreshToken, ok := response["refresh_token"].(string)
+		require.True(t, ok, "Refresh token should be present in response")
+		require.NotEmpty(t, refreshToken, "Refresh token should not be empty")
 
 		// Verify the refresh token can be verified
-		userID, err := tc.db.VerifyRefreshToken(context.Background(), refreshCookie.Value)
+		userID, err := tc.db.VerifyRefreshToken(context.Background(), refreshToken)
 		require.NoError(t, err)
 		assert.Equal(t, "test_user_patron", userID)
 	})

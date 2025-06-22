@@ -32,33 +32,122 @@ type WebhookEvent struct {
 	Payload      json.RawMessage `json:"payload"`
 }
 
+// PatreonUserAttributes represents user attributes from Patreon API
+type PatreonUserAttributes struct {
+	Email     string `json:"email"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+// PatreonMembershipData represents membership data from Patreon API
+type PatreonMembershipData struct {
+	ID string `json:"id"`
+}
+
+// PatreonMemberships represents memberships relationship from Patreon API
+type PatreonMemberships struct {
+	Data []PatreonMembershipData `json:"data"`
+}
+
+// PatreonUserRelationships represents user relationships from Patreon API
+type PatreonUserRelationships struct {
+	Memberships PatreonMemberships `json:"memberships"`
+}
+
+// PatreonUserData represents user data from Patreon API
+type PatreonUserData struct {
+	ID            string                   `json:"id"`
+	Attributes    PatreonUserAttributes    `json:"attributes"`
+	Relationships PatreonUserRelationships `json:"relationships"`
+}
+
+// PatreonIncludedAttributes represents included attributes from Patreon API
+type PatreonIncludedAttributes struct {
+	PatronStatus string `json:"patron_status"`
+}
+
+// PatreonIncluded represents included data from Patreon API
+type PatreonIncluded struct {
+	Type       string                    `json:"type"`
+	ID         string                    `json:"id"`
+	Attributes PatreonIncludedAttributes `json:"attributes"`
+}
+
+// PatreonIdentityResponse represents the Patreon identity API response
+type PatreonIdentityResponse struct {
+	Data     PatreonUserData   `json:"data"`
+	Included []PatreonIncluded `json:"included"`
+}
+
+// RefreshTokenRequest represents the request body for token refresh
+type RefreshTokenRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// AuthResponse represents the authentication response
+type AuthResponse struct {
+	Status       string `json:"status"`
+	Message      string `json:"message"`
+	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// AuthStatusResponse represents the authentication status response
+type AuthStatusResponse struct {
+	Status string      `json:"status"`
+	UserID interface{} `json:"user_id,omitempty"`
+	Tier   interface{} `json:"tier,omitempty"`
+}
+
+// MemberPledgeAttributes represents member attributes from pledge data
+type MemberPledgeAttributes struct {
+	Email        string `json:"email"`
+	FirstName    string `json:"first_name"`
+	LastName     string `json:"last_name"`
+	PatronStatus string `json:"patron_status"`
+}
+
+// EntitledTierData represents entitled tier data from pledge data
+type EntitledTierData struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
+
+// CurrentlyEntitledTiers represents currently entitled tiers from pledge data
+type CurrentlyEntitledTiers struct {
+	Data []EntitledTierData `json:"data"`
+}
+
+// MemberPledgeRelationships represents member relationships from pledge data
+type MemberPledgeRelationships struct {
+	CurrentlyEntitledTiers CurrentlyEntitledTiers `json:"currently_entitled_tiers"`
+}
+
+// MemberPledgeIncludedAttributes represents included attributes from pledge data
+type MemberPledgeIncludedAttributes struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+// MemberPledgeIncluded represents included data from pledge data
+type MemberPledgeIncluded struct {
+	Type       string                         `json:"type"`
+	ID         string                         `json:"id"`
+	Attributes MemberPledgeIncludedAttributes `json:"attributes"`
+}
+
+// MemberPledgeDataStruct represents the data field in MemberPledgeData
+type MemberPledgeDataStruct struct {
+	Attributes    MemberPledgeAttributes    `json:"attributes"`
+	Relationships MemberPledgeRelationships `json:"relationships"`
+}
+
 // MemberPledgeData represents the data structure for member events
 type MemberPledgeData struct {
-	Data struct {
-		Attributes struct {
-			Email        string `json:"email"`
-			FirstName    string `json:"first_name"`
-			LastName     string `json:"last_name"`
-			PatronStatus string `json:"patron_status"`
-		} `json:"attributes"`
-		Relationships struct {
-			CurrentlyEntitledTiers struct {
-				Data []struct {
-					ID   string `json:"id"`
-					Type string `json:"type"`
-				} `json:"data"`
-			} `json:"currently_entitled_tiers"`
-		} `json:"relationships"`
-	} `json:"data"`
-	Included []struct {
-		Type       string `json:"type"`
-		ID         string `json:"id"`
-		Attributes struct {
-			Title       string `json:"title"`
-			Description string `json:"description"`
-		} `json:"attributes"`
-	} `json:"included"`
+	Data     MemberPledgeDataStruct `json:"data"`
+	Included []MemberPledgeIncluded `json:"included"`
 }
+
 type ExternalAuth interface {
 	HandleLogin(http.ResponseWriter, *http.Request)
 	HandleCallback(http.ResponseWriter, *http.Request)
@@ -103,47 +192,6 @@ func (a *PatreonAuth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
-// getTierCodeFromAPIResponse extracts tier code from the OAuth API response
-func getTierCodeFromAPIResponse(result struct {
-	Data struct {
-		ID         string `json:"id"`
-		Type       string `json:"type"`
-		Attributes struct {
-			Email     string `json:"email"`
-			FirstName string `json:"first_name"`
-			LastName  string `json:"last_name"`
-		} `json:"attributes"`
-	} `json:"data"`
-	Included []struct {
-		Type       string `json:"type"`
-		ID         string `json:"id"`
-		Attributes struct {
-			PatronStatus string `json:"patron_status"`
-			Title        string `json:"title"`
-		} `json:"attributes"`
-	} `json:"included"`
-}) string {
-	// Look for tier information in the included data
-	for _, included := range result.Included {
-		if included.Type == "tier" {
-			// Map tier titles to tier codes
-			switch included.Attributes.Title {
-			case "Apprentice":
-				return "apprentice"
-			case "Journeyman":
-				return "journeyman"
-			case "Master":
-				return "master"
-			default:
-				return "non_patron"
-			}
-		}
-	}
-
-	// If we can't find tier information, return default
-	return "non_patron"
-}
-
 // HandlePatreonCallback processes the OAuth2 callback from Patreon
 func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
@@ -174,30 +222,7 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(resp.Body)
 	log.Printf("DEBUG: Raw Patreon user JSON: %s", string(body))
 
-	var result struct {
-		Data struct {
-			ID         string `json:"id"`
-			Attributes struct {
-				Email     string `json:"email"`
-				FirstName string `json:"first_name"`
-				LastName  string `json:"last_name"`
-			} `json:"attributes"`
-			Relationships struct {
-				Memberships struct {
-					Data []struct {
-						ID string `json:"id"`
-					} `json:"data"`
-				} `json:"memberships"`
-			} `json:"relationships"`
-		} `json:"data"`
-		Included []struct {
-			Type       string `json:"type"`
-			ID         string `json:"id"`
-			Attributes struct {
-				PatronStatus string `json:"patron_status"`
-			} `json:"attributes"`
-		} `json:"included"`
-	}
+	var result PatreonIdentityResponse
 
 	if err := json.Unmarshal(body, &result); err != nil {
 		log.Printf("ERROR: Failed to parse identity JSON: %v", err)
@@ -210,17 +235,16 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	firstName := result.Data.Attributes.FirstName
 	lastName := result.Data.Attributes.LastName
 
-	// Assume non-patron by default
-	tierTitle := "non_patron"
-	patronStatus := "non_patron"
-
+	// Check if user is an active patron
 	if len(result.Included) > 0 && result.Included[0].Attributes.PatronStatus == "active_patron" {
-		tierTitle = "apprentice"
-		patronStatus = "active_patron"
+		// User is an active patron, proceed with authentication
 	} else {
 		http.Error(w, "You must be a patron to access this feature.", http.StatusForbidden)
 		return
 	}
+
+	tierTitle := "apprentice" // Default tier for active patrons
+	patronStatus := "active_patron"
 
 	tokenExpiresAt := defaultExpiry(24)
 	err = a.db.SaveUser(
@@ -265,40 +289,37 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "scryforge_auth",
-		Value:    jwtToken,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   3600,
-	})
-	http.SetCookie(w, &http.Cookie{
-		Name:     "scryforge_refresh",
-		Value:    refreshToken,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   30 * 24 * 3600,
-	})
-
 	log.Printf("INFO: Successfully authenticated Patreon user ID: %s", userID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok","message":"authenticated"}`))
+	response := AuthResponse{
+		Status:       "ok",
+		Message:      "authenticated",
+		Token:        jwtToken,
+		RefreshToken: refreshToken,
+	}
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("ERROR: Failed to encode response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
 func (a *PatreonAuth) HandleRefresh(w http.ResponseWriter, r *http.Request) {
-	refreshCookie, err := r.Cookie("scryforge_refresh")
-	if err != nil {
-		http.Error(w, "Missing refresh token", http.StatusUnauthorized)
+	// Parse the request body to get the refresh token
+	var requestBody RefreshTokenRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	refreshToken := refreshCookie.Value
-	patreonID, err := a.db.VerifyRefreshToken(r.Context(), refreshToken)
+	if requestBody.RefreshToken == "" {
+		http.Error(w, "Missing refresh token", http.StatusBadRequest)
+		return
+	}
+
+	patreonID, err := a.db.VerifyRefreshToken(r.Context(), requestBody.RefreshToken)
 	if err != nil {
 		http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
 		return
@@ -313,58 +334,61 @@ func (a *PatreonAuth) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "scryforge_auth",
-		Value:    newJWT,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   3600,
-	})
+	// Generate a new refresh token
+	newRefreshToken := generateSecureRandomToken()
+	err = a.db.StoreRefreshToken(r.Context(), patreonID, newRefreshToken)
+	if err != nil {
+		http.Error(w, "Failed to store refresh token", http.StatusInternalServerError)
+		return
+	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	response := AuthResponse{
+		Status:       "ok",
+		Message:      "token refreshed",
+		Token:        newJWT,
+		RefreshToken: newRefreshToken,
+	}
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("ERROR: Failed to encode response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
 func (a *PatreonAuth) HandleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	authCookie, err := r.Cookie("scryforge_auth")
+	// Try to extract and validate Bearer token
+	tokenString, err := extractBearerToken(r)
 	if err == nil {
-		// Try parsing the JWT
-		secret := strings.TrimSpace(os.Getenv("JWT_SECRET_CURRENT"))
-		if secret == "" {
-			log.Printf("ERROR: JWT_SECRET_CURRENT environment variable is not set")
-			http.Error(w, "Authentication service unavailable", http.StatusInternalServerError)
-			return
-		}
-
-		token, err := jwt.Parse(authCookie.Value, func(t *jwt.Token) (interface{}, error) {
-			// Validate the signing method to prevent algorithm confusion attacks
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		claims, err := validateJWT(tokenString)
+		if err == nil {
+			// Token is valid, return authenticated status
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			response := AuthStatusResponse{
+				Status: "authenticated",
+				UserID: claims["sub"],
+				Tier:   claims["tier"],
 			}
-			return []byte(secret), nil
-		})
-		if err == nil && token.Valid {
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{"status": "authenticated"})
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				log.Printf("ERROR: Failed to encode response: %v", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
 			return
 		}
 	}
 
-	// Try checking refresh token
-	refreshCookie, err := r.Cookie("scryforge_refresh")
-	if err == nil {
-		userID, err := a.db.VerifyRefreshToken(r.Context(), refreshCookie.Value)
-		if err == nil && userID != "" {
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{"status": "renewal_required"})
-			return
-		}
-	}
-
-	// No valid session or refresh token
+	// No valid Bearer token found
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "unauthenticated"})
+	response := AuthStatusResponse{Status: "unauthenticated"}
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("ERROR: Failed to encode response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
 func generateSecureRandomToken() string {
@@ -517,7 +541,7 @@ func (a *PatreonAuth) handleMemberCreate(patreonID, tierID, patronStatus string,
 		data.Data.Attributes.Email,
 		data.Data.Attributes.FirstName,
 		data.Data.Attributes.LastName,
-		tierID,
+		tierCode,
 		patronStatus,
 		"", // No access token for webhook events
 		"", // No refresh token for webhook events
@@ -548,7 +572,7 @@ func (a *PatreonAuth) handleMemberUpdate(patreonID, tierID, patronStatus string,
 		data.Data.Attributes.Email,     // Use email from pledge data
 		data.Data.Attributes.FirstName, // Use first name from pledge data
 		data.Data.Attributes.LastName,  // Use last name from pledge data
-		tierID,
+		tierCode,                       // Use the extracted tier code instead of tierID
 		patronStatus,
 		"", // Keep existing access token
 		"", // Keep existing refresh token
@@ -594,5 +618,86 @@ func defaultExpiry(hours int) pgtype.Timestamp {
 	return pgtype.Timestamp{
 		Time:  time.Now().Add(time.Duration(hours) * time.Hour),
 		Valid: true,
+	}
+}
+
+// extractBearerToken extracts and validates the Bearer token from the Authorization header
+func extractBearerToken(r *http.Request) (string, error) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return "", fmt.Errorf("missing Authorization header")
+	}
+
+	// Check if it's a Bearer token
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(authHeader, bearerPrefix) {
+		return "", fmt.Errorf("invalid Authorization header format")
+	}
+
+	token := strings.TrimPrefix(authHeader, bearerPrefix)
+	if token == "" {
+		return "", fmt.Errorf("empty token")
+	}
+
+	return token, nil
+}
+
+// validateJWT validates a JWT token and returns the claims if valid
+func validateJWT(tokenString string) (jwt.MapClaims, error) {
+	secret := strings.TrimSpace(os.Getenv("JWT_SECRET_CURRENT"))
+	if secret == "" {
+		return nil, fmt.Errorf("JWT_SECRET_CURRENT environment variable is not set")
+	}
+
+	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		// Validate the signing method to prevent algorithm confusion attacks
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if !token.Valid {
+		return nil, fmt.Errorf("invalid token")
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok {
+		return claims, nil
+	}
+
+	return nil, fmt.Errorf("invalid token claims")
+}
+
+// Context key types to avoid collisions
+type contextKey string
+
+const (
+	userIDKey contextKey = "user_id"
+	tierKey   contextKey = "tier"
+)
+
+// AuthMiddleware creates a middleware that validates Bearer tokens
+func (a *PatreonAuth) AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tokenString, err := extractBearerToken(r)
+		if err != nil {
+			http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+
+		claims, err := validateJWT(tokenString)
+		if err != nil {
+			http.Error(w, "Unauthorized: invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		// Add user information to request context
+		ctx := context.WithValue(r.Context(), userIDKey, claims["sub"])
+		ctx = context.WithValue(ctx, tierKey, claims["tier"])
+		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 }

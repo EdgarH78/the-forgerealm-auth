@@ -1,0 +1,470 @@
+openapi: 3.0.3
+info:
+  title: ForgeRealm Auth Service API
+  description: |
+    Authentication service for ForgeRealm applications.
+    
+    This service provides OAuth2 authentication via Patreon, token-based login flows,
+    and webhook handling for Patreon membership events.
+    
+    ## Authentication
+    The service uses JWT tokens stored in HTTP-only cookies for session management.
+    Refresh tokens are also provided for token renewal.
+    
+    ## Security
+    - All endpoints use HTTPS
+    - JWT tokens are signed with HMAC-SHA256
+    - Webhook signatures are verified using HMAC-MD5
+    - Tokens have appropriate expiration times
+  version: 1.0.0
+  contact:
+    name: ForgeRealm Support
+    url: https://theforgerealm.com
+  license:
+    name: Proprietary
+    url: https://theforgerealm.com
+
+servers:
+  - url: https://auth.theforgerealm.com
+    description: Production server
+  - url: http://localhost:8080
+    description: Development server
+
+paths:
+  /:
+    get:
+      summary: Home page
+      description: Returns a welcome message for the ForgeRealm Auth Service
+      responses:
+        '200':
+          description: Welcome message
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Welcome to ForgeRealm Auth Service"
+
+  /healthz:
+    get:
+      summary: Health check
+      description: Returns the health status of the service
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "OK"
+
+  /auth/login:
+    get:
+      summary: Initiate Patreon OAuth login
+      description: |
+        Redirects the user to Patreon's OAuth authorization page.
+        If a token parameter is provided, it will be used as the state parameter
+        for the OAuth flow, enabling token-based login fulfillment.
+      tags:
+        - Authentication
+      parameters:
+        - name: token
+          in: query
+          description: Optional login token for token-based authentication flow
+          required: false
+          schema:
+            type: string
+            example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        '302':
+          description: Redirect to Patreon OAuth authorization page
+          headers:
+            Location:
+              description: Patreon OAuth URL
+              schema:
+                type: string
+                example: "https://www.patreon.com/oauth2/authorize?client_id=...&redirect_uri=...&response_type=code&scope=identity%20identity%5Bemail%5D%20identity.memberships&state=..."
+
+  /auth/callback:
+    get:
+      summary: OAuth callback handler
+      description: |
+        Handles the OAuth callback from Patreon after successful authorization.
+        Processes the authorization code, retrieves user information, and sets
+        authentication cookies. If a state parameter contains a login token,
+        it will fulfill the token-based login.
+      tags:
+        - Authentication
+      parameters:
+        - name: code
+          in: query
+          description: Authorization code from Patreon OAuth
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          description: State parameter (may contain login token)
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  message:
+                    type: string
+                    example: "authenticated"
+        '400':
+          description: Missing authorization code
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Code not found"
+        '403':
+          description: User is not a patron
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "You must be a patron to access this feature."
+        '500':
+          description: Internal server error
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Failed to exchange token: invalid_grant"
+
+  /auth/status:
+    get:
+      summary: Check authentication status
+      description: |
+        Checks the current authentication status by validating JWT tokens
+        and refresh tokens from cookies. Returns the authentication state.
+      tags:
+        - Authentication
+      responses:
+        '200':
+          description: Authentication status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [authenticated, renewal_required, unauthenticated]
+                    description: Current authentication status
+                    example: "authenticated"
+        '500':
+          description: Authentication service unavailable
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Authentication service unavailable"
+
+  /auth/refresh:
+    post:
+      summary: Refresh authentication token
+      description: |
+        Refreshes the JWT token using a valid refresh token from cookies.
+        Generates a new JWT token and refresh token.
+      tags:
+        - Authentication
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  message:
+                    type: string
+                    example: "token refreshed"
+        '401':
+          description: Missing or invalid refresh token
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Missing refresh token"
+        '500':
+          description: Internal server error
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Failed to generate token"
+
+  /auth/token/start:
+    post:
+      summary: Start token-based login
+      description: |
+        Creates a new login token for token-based authentication flow.
+        The token expires after 10 minutes and can be used to fulfill
+        authentication via the OAuth callback.
+      tags:
+        - Token Login
+      requestBody:
+        description: Optional client information
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client_name:
+                  type: string
+                  description: Name of the client requesting the token
+                  example: "ForgeRealm Web App"
+      responses:
+        '200':
+          description: Login token created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    format: uuid
+                    description: The login token to be used for authentication
+                    example: "550e8400-e29b-41d4-a716-446655440000"
+        '500':
+          description: Failed to create login token
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Failed to create login token"
+
+  /auth/token/status:
+    get:
+      summary: Check token login status
+      description: |
+        Checks if a token-based login has been fulfilled.
+        Returns whether the token has been used for authentication.
+      tags:
+        - Token Login
+      parameters:
+        - name: token
+          in: query
+          description: The login token to check
+          required: true
+          schema:
+            type: string
+            format: uuid
+            example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        '200':
+          description: Token status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  fulfilled:
+                    type: boolean
+                    description: Whether the token has been fulfilled
+                    example: true
+        '400':
+          description: Missing token parameter
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Missing token"
+        '404':
+          description: Invalid or expired token
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Invalid or expired token"
+
+  /auth/webhook:
+    post:
+      summary: Patreon webhook handler
+      description: |
+        Handles webhook events from Patreon for membership changes.
+        Verifies webhook signatures and processes membership events.
+        Supports member creation, updates, and deletion events.
+      tags:
+        - Webhooks
+      security:
+        - PatreonWebhook: []
+      requestBody:
+        description: Patreon webhook event data
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEvent'
+      responses:
+        '200':
+          description: Webhook processed successfully
+        '400':
+          description: Invalid request body
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Invalid request body"
+        '401':
+          description: Invalid webhook signature
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Invalid signature"
+        '500':
+          description: Internal server error
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Failed to save webhook event"
+
+components:
+  schemas:
+    WebhookEvent:
+      type: object
+      description: Patreon webhook event structure
+      properties:
+        event_type:
+          type: string
+          description: Type of webhook event
+          enum: [members:create, members:update, members:delete]
+          example: "members:create"
+        patreon_id:
+          type: string
+          description: Patreon user ID
+          example: "12345678"
+        tier_id:
+          type: string
+          description: Patreon tier ID
+          example: "98765432"
+        patron_status:
+          type: string
+          description: Current patron status
+          enum: [active_patron, declined_patron, former_patron, non_patron]
+          example: "active_patron"
+        payload:
+          type: object
+          description: Raw webhook payload data
+          additionalProperties: true
+      required:
+        - event_type
+        - patreon_id
+
+    MemberPledgeData:
+      type: object
+      description: Member pledge data from Patreon webhook
+      properties:
+        data:
+          type: object
+          properties:
+            attributes:
+              type: object
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: "user@example.com"
+                first_name:
+                  type: string
+                  example: "John"
+                last_name:
+                  type: string
+                  example: "Doe"
+                patron_status:
+                  type: string
+                  example: "active_patron"
+            relationships:
+              type: object
+              properties:
+                currently_entitled_tiers:
+                  type: object
+                  properties:
+                    data:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          type:
+                            type: string
+        included:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              id:
+                type: string
+              attributes:
+                type: object
+                properties:
+                  title:
+                    type: string
+                  description:
+                    type: string
+
+  securitySchemes:
+    PatreonWebhook:
+      type: apiKey
+      name: X-Patreon-Signature
+      in: header
+      description: HMAC-MD5 signature of the webhook payload
+
+  responses:
+    UnauthorizedError:
+      description: Authentication required
+      content:
+        text/plain:
+          schema:
+            type: string
+            example: "Unauthorized"
+
+    ForbiddenError:
+      description: Access forbidden
+      content:
+        text/plain:
+          schema:
+            type: string
+            example: "Forbidden"
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        text/plain:
+          schema:
+            type: string
+            example: "Internal server error"
+
+tags:
+  - name: Authentication
+    description: OAuth2 authentication endpoints
+  - name: Token Login
+    description: Token-based authentication flow
+  - name: Webhooks
+    description: Patreon webhook handling
+  - name: Health
+    description: Service health monitoring 

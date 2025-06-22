@@ -264,6 +264,7 @@ paths:
       description: |
         Checks if a token-based login has been fulfilled.
         Returns whether the token has been used for authentication.
+        If the token is fulfilled, also returns a JWT token for immediate authentication.
       tags:
         - Token Login
       parameters:
@@ -281,12 +282,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  fulfilled:
-                    type: boolean
-                    description: Whether the token has been fulfilled
-                    example: true
+                $ref: '#/components/schemas/TokenStatusResponse'
         '400':
           description: Missing token parameter
           content:
@@ -581,6 +577,19 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PatreonIncluded'
+
+    TokenStatusResponse:
+      type: object
+      description: Token status response structure
+      properties:
+        fulfilled:
+          type: boolean
+          description: Whether the token has been fulfilled
+          example: true
+        token:
+          type: string
+          description: JWT token for immediate authentication
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 
   securitySchemes:
     PatreonWebhook:

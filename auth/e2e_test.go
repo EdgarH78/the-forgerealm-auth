@@ -100,14 +100,31 @@ func (tc *TestContainer) cleanup() {
 }
 
 func runMigrations(pool *pgxpool.Pool) error {
-	// Read the migration script from the actual file
-	migrationSQL, err := os.ReadFile("../scripts/001_create_tables.sql")
+	// Read the first migration script
+	migrationSQL1, err := os.ReadFile("../scripts/001_create_tables.sql")
 	if err != nil {
-		return fmt.Errorf("failed to read migration file: %v", err)
+		return fmt.Errorf("failed to read migration file 1: %v", err)
 	}
 
-	_, err = pool.Exec(context.Background(), string(migrationSQL))
-	return err
+	// Read the second migration script
+	migrationSQL2, err := os.ReadFile("../scripts/002_add_jwt_consumed_field.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration file 2: %v", err)
+	}
+
+	// Execute first migration
+	_, err = pool.Exec(context.Background(), string(migrationSQL1))
+	if err != nil {
+		return fmt.Errorf("failed to execute first migration: %v", err)
+	}
+
+	// Execute second migration
+	_, err = pool.Exec(context.Background(), string(migrationSQL2))
+	if err != nil {
+		return fmt.Errorf("failed to execute second migration: %v", err)
+	}
+
+	return nil
 }
 
 func TestE2E_TokenLoginFlow(t *testing.T) {
@@ -149,10 +166,11 @@ func TestE2E_TokenLoginFlow(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code)
 
-		var resp map[string]bool
+		var resp TokenStatusResponse
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err)
-		assert.False(t, resp["fulfilled"])
+		assert.False(t, resp.Fulfilled)
+		assert.Empty(t, resp.Token) // Should not have token when not fulfilled
 	})
 
 	// Test 3: Fulfill token login (simulate OAuth callback)
@@ -191,10 +209,29 @@ func TestE2E_TokenLoginFlow(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code)
 
-		var resp map[string]bool
+		var resp TokenStatusResponse
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err)
-		assert.True(t, resp["fulfilled"])
+		assert.True(t, resp.Fulfilled)
+		assert.NotEmpty(t, resp.Token) // Should have JWT token when fulfilled
+	})
+
+	// Test 5: Check token status again (should be fulfilled but no JWT token)
+	t.Run("CheckTokenStatus_Fulfilled_SecondTime", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		req := httptest.NewRequest("GET", "/auth/token/status?token="+testToken, nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.CheckTokenStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp TokenStatusResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Fulfilled)
+		assert.Empty(t, resp.Token) // Should NOT have JWT token on second check
 	})
 }
 
@@ -698,10 +735,11 @@ func TestE2E_HandleCallback_WithRealDatabase(t *testing.T) {
 		tokenStatusW := httptest.NewRecorder()
 		tokenLogin.CheckTokenStatus(tokenStatusW, tokenStatusReq)
 
-		var statusResp map[string]bool
+		var statusResp TokenStatusResponse
 		err = json.NewDecoder(tokenStatusW.Body).Decode(&statusResp)
 		require.NoError(t, err)
-		assert.True(t, statusResp["fulfilled"], "Token login should be fulfilled")
+		assert.True(t, statusResp.Fulfilled, "Token login should be fulfilled")
+		assert.NotEmpty(t, statusResp.Token, "Should have JWT token when fulfilled")
 
 		// Verify user was saved to database
 		tierCode, err := tc.db.GetTierCodeForUser(context.Background(), "test_user_patron")
@@ -835,5 +873,146 @@ func TestE2E_HandleCallback_WithRealDatabase(t *testing.T) {
 		userID, err := tc.db.VerifyRefreshToken(context.Background(), refreshToken)
 		require.NoError(t, err)
 		assert.Equal(t, "test_user_patron", userID)
+	})
+}
+
+func TestE2E_JWTConsumptionSecurity(t *testing.T) {
+	tc := setupTestContainer(t)
+	defer tc.cleanup()
+
+	// Create token login handler
+	tokenLogin := NewTokenLogin(tc.db)
+
+	// Variables to share between test cases
+	var testToken string
+	var firstJWT string
+
+	// Test 1: Create a token login
+	t.Run("CreateTokenLogin", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/auth/token/start", nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.StartTokenLogin(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp map[string]string
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.NotEmpty(t, resp["token"])
+
+		// Store token for next tests
+		testToken = resp["token"]
+	})
+
+	// Test 2: Fulfill the token login
+	t.Run("FulfillTokenLogin", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		// Create a test user
+		userID := "test_security_user_123"
+		err := tc.db.SaveUser(
+			context.Background(),
+			userID,
+			"security@example.com",
+			"Security",
+			"Test",
+			"apprentice",
+			"active_patron",
+			"access_token_123",
+			"refresh_token_123",
+			pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		)
+		require.NoError(t, err)
+
+		// Fulfill the token login
+		err = tc.db.FulfillTokenLogin(context.Background(), testToken, userID)
+		require.NoError(t, err)
+	})
+
+	// Test 3: First check - should return JWT
+	t.Run("FirstCheck_ShouldReturnJWT", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		req := httptest.NewRequest("GET", "/auth/token/status?token="+testToken, nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.CheckTokenStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp TokenStatusResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Fulfilled)
+		assert.NotEmpty(t, resp.Token, "First check should return JWT token")
+
+		// Store the JWT for verification
+		firstJWT = resp.Token
+	})
+
+	// Test 4: Second check - should NOT return JWT
+	t.Run("SecondCheck_ShouldNotReturnJWT", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		req := httptest.NewRequest("GET", "/auth/token/status?token="+testToken, nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.CheckTokenStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp TokenStatusResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Fulfilled)
+		assert.Empty(t, resp.Token, "Second check should NOT return JWT token")
+	})
+
+	// Test 5: Third check - should still NOT return JWT
+	t.Run("ThirdCheck_ShouldStillNotReturnJWT", func(t *testing.T) {
+		require.NotEmpty(t, testToken)
+
+		req := httptest.NewRequest("GET", "/auth/token/status?token="+testToken, nil)
+		w := httptest.NewRecorder()
+
+		tokenLogin.CheckTokenStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp TokenStatusResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Fulfilled)
+		assert.Empty(t, resp.Token, "Third check should still NOT return JWT token")
+	})
+
+	// Test 6: Verify the JWT from first check is valid
+	t.Run("VerifyFirstJWTIsValid", func(t *testing.T) {
+		require.NotEmpty(t, firstJWT)
+
+		// Create a request with the JWT to test auth status
+		req := httptest.NewRequest("GET", "/auth/status", nil)
+		req.Header.Set("Authorization", "Bearer "+firstJWT)
+		w := httptest.NewRecorder()
+
+		// Create Patreon auth handler for testing
+		config := &oauth2.Config{
+			ClientID:     "test_client_id",
+			ClientSecret: "test_client_secret",
+			RedirectURL:  "http://localhost:8080/auth/callback",
+		}
+		patreonAuth := NewPatreonAuth(tc.db, config)
+
+		patreonAuth.HandleAuthStatus(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var resp AuthStatusResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.Equal(t, "authenticated", resp.Status)
+		assert.NotEmpty(t, resp.UserID, "JWT should contain a valid user ID")
+		assert.Equal(t, "apprentice", resp.Tier, "JWT should contain the correct tier")
 	})
 }

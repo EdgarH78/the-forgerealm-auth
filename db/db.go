@@ -183,18 +183,43 @@ func (db *PostgresDB) SaveTokenLogin(ctx context.Context, token string, expiresA
 	return nil
 }
 
-func (db *PostgresDB) CheckTokenLogin(ctx context.Context, token string) (bool, error) {
+func (db *PostgresDB) CheckTokenLogin(ctx context.Context, token string) (bool, string, error) {
 	var fulfilled bool
+	var userID *string
+	var jwtConsumed bool
 	err := db.pool.QueryRow(ctx,
-		`SELECT fulfilled FROM forgerealm_auth.token_logins WHERE token = $1 AND expires_at > now()`,
+		`SELECT fulfilled, user_id, jwt_consumed FROM forgerealm_auth.token_logins WHERE token = $1 AND expires_at > now()`,
 		token,
-	).Scan(&fulfilled)
+	).Scan(&fulfilled, &userID, &jwtConsumed)
 	if err != nil {
 		log.Printf("ERROR: Failed to check token login: %v", err)
-		return false, err
+		return false, "", err
 	}
+
+	var userIDStr string
+	if userID != nil {
+		userIDStr = *userID
+	}
+
+	// If token is fulfilled and JWT hasn't been consumed yet, mark it as consumed
+	if fulfilled && !jwtConsumed && userIDStr != "" {
+		_, updateErr := db.pool.Exec(ctx,
+			`UPDATE forgerealm_auth.token_logins SET jwt_consumed = true WHERE token = $1`,
+			token,
+		)
+		if updateErr != nil {
+			log.Printf("ERROR: Failed to mark JWT as consumed for token %s: %v", token, updateErr)
+			// Don't fail the request, just log the error
+		} else {
+			log.Printf("INFO: Marked JWT as consumed for token: %s", token)
+		}
+	} else if fulfilled && jwtConsumed {
+		// JWT has already been consumed, return empty string
+		userIDStr = ""
+	}
+
 	log.Printf("INFO: Successfully checked token login for token: %s", token)
-	return fulfilled, nil
+	return fulfilled, userIDStr, nil
 }
 
 func (db *PostgresDB) FulfillTokenLogin(ctx context.Context, token string, userID string) error {

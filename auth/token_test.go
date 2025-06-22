@@ -22,9 +22,9 @@ func (m *MockTokenDatabase) SaveTokenLogin(ctx context.Context, token string, ex
 	return args.Error(0)
 }
 
-func (m *MockTokenDatabase) CheckTokenLogin(ctx context.Context, token string) (bool, error) {
+func (m *MockTokenDatabase) CheckTokenLogin(ctx context.Context, token string) (bool, string, error) {
 	args := m.Called(ctx, token)
-	return args.Bool(0), args.Error(1)
+	return args.Bool(0), args.String(1), args.Error(2)
 }
 
 func TestStartTokenLogin_Success(t *testing.T) {
@@ -64,7 +64,7 @@ func TestStartTokenLogin_DBError(t *testing.T) {
 func TestCheckTokenStatus_Success(t *testing.T) {
 	mockDB := new(MockTokenDatabase)
 	tokenLogin := &TokenLogin{db: mockDB}
-	mockDB.On("CheckTokenLogin", mock.Anything, "sometoken").Return(true, nil)
+	mockDB.On("CheckTokenLogin", mock.Anything, "sometoken").Return(true, "test_user_123", nil)
 
 	req := httptest.NewRequest("GET", "/auth/token/status?token=sometoken", nil)
 	w := httptest.NewRecorder()
@@ -72,10 +72,11 @@ func TestCheckTokenStatus_Success(t *testing.T) {
 	tokenLogin.CheckTokenStatus(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	var resp map[string]bool
+	var resp TokenStatusResponse
 	err := json.NewDecoder(w.Body).Decode(&resp)
 	assert.NoError(t, err)
-	assert.Equal(t, true, resp["fulfilled"])
+	assert.Equal(t, true, resp.Fulfilled)
+	assert.NotEmpty(t, resp.Token) // Should have JWT token when fulfilled
 }
 
 func TestCheckTokenStatus_MissingToken(t *testing.T) {
@@ -94,7 +95,7 @@ func TestCheckTokenStatus_MissingToken(t *testing.T) {
 func TestCheckTokenStatus_DBError(t *testing.T) {
 	mockDB := new(MockTokenDatabase)
 	tokenLogin := &TokenLogin{db: mockDB}
-	mockDB.On("CheckTokenLogin", mock.Anything, "badtoken").Return(false, errors.New("not found"))
+	mockDB.On("CheckTokenLogin", mock.Anything, "badtoken").Return(false, "", errors.New("not found"))
 
 	req := httptest.NewRequest("GET", "/auth/token/status?token=badtoken", nil)
 	w := httptest.NewRecorder()
@@ -103,4 +104,22 @@ func TestCheckTokenStatus_DBError(t *testing.T) {
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
 	assert.Contains(t, w.Body.String(), "Invalid or expired token")
+}
+
+func TestCheckTokenStatus_NotFulfilled(t *testing.T) {
+	mockDB := new(MockTokenDatabase)
+	tokenLogin := &TokenLogin{db: mockDB}
+	mockDB.On("CheckTokenLogin", mock.Anything, "unfulfilledtoken").Return(false, "", nil)
+
+	req := httptest.NewRequest("GET", "/auth/token/status?token=unfulfilledtoken", nil)
+	w := httptest.NewRecorder()
+
+	tokenLogin.CheckTokenStatus(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp TokenStatusResponse
+	err := json.NewDecoder(w.Body).Decode(&resp)
+	assert.NoError(t, err)
+	assert.Equal(t, false, resp.Fulfilled)
+	assert.Empty(t, resp.Token) // Should not have JWT token when not fulfilled
 }

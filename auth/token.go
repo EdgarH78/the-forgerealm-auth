@@ -12,6 +12,8 @@ import (
 type TokenDatabase interface {
 	SaveTokenLogin(ctx context.Context, token string, expiresAt time.Time) error
 	CheckTokenLogin(ctx context.Context, token string) (bool, string, error)
+	StoreRefreshToken(ctx context.Context, userID string, token string) error
+	GetPatreonIDFromUserID(ctx context.Context, userID string) (string, error)
 }
 
 type TokenLogin struct {
@@ -43,8 +45,9 @@ func (t *TokenLogin) StartTokenLogin(w http.ResponseWriter, r *http.Request) {
 
 // TokenStatusResponse represents the token status response
 type TokenStatusResponse struct {
-	Fulfilled bool   `json:"fulfilled"`
-	Token     string `json:"token,omitempty"`
+	Fulfilled    bool   `json:"fulfilled"`
+	Token        string `json:"token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
 // GET /auth/token/status?token=...
@@ -74,6 +77,22 @@ func (t *TokenLogin) CheckTokenStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		response.Token = jwtToken
+
+		// Get Patreon ID from user ID for storing refresh token
+		patreonID, err := t.db.GetPatreonIDFromUserID(r.Context(), userID)
+		if err != nil {
+			http.Error(w, "Failed to get user information", http.StatusInternalServerError)
+			return
+		}
+
+		// Generate a refresh token
+		refreshToken := generateSecureRandomToken()
+		err = t.db.StoreRefreshToken(r.Context(), patreonID, refreshToken)
+		if err != nil {
+			http.Error(w, "Failed to store refresh token", http.StatusInternalServerError)
+			return
+		}
+		response.RefreshToken = refreshToken
 	}
 
 	w.Header().Set("Content-Type", "application/json")

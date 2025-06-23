@@ -213,7 +213,8 @@ func TestE2E_TokenLoginFlow(t *testing.T) {
 		err := json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err)
 		assert.True(t, resp.Fulfilled)
-		assert.NotEmpty(t, resp.Token) // Should have JWT token when fulfilled
+		assert.NotEmpty(t, resp.Token)        // Should have JWT token when fulfilled
+		assert.NotEmpty(t, resp.RefreshToken) // Should have refresh token when fulfilled
 	})
 
 	// Test 5: Check token status again (should be fulfilled but no JWT token)
@@ -946,6 +947,7 @@ func TestE2E_JWTConsumptionSecurity(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, resp.Fulfilled)
 		assert.NotEmpty(t, resp.Token, "First check should return JWT token")
+		assert.NotEmpty(t, resp.RefreshToken, "First check should return refresh token")
 
 		// Store the JWT for verification
 		firstJWT = resp.Token
@@ -967,6 +969,7 @@ func TestE2E_JWTConsumptionSecurity(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, resp.Fulfilled)
 		assert.Empty(t, resp.Token, "Second check should NOT return JWT token")
+		assert.Empty(t, resp.RefreshToken, "Second check should NOT return refresh token")
 	})
 
 	// Test 5: Third check - should still NOT return JWT
@@ -985,6 +988,7 @@ func TestE2E_JWTConsumptionSecurity(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, resp.Fulfilled)
 		assert.Empty(t, resp.Token, "Third check should still NOT return JWT token")
+		assert.Empty(t, resp.RefreshToken, "Third check should still NOT return refresh token")
 	})
 
 	// Test 6: Verify the JWT from first check is valid

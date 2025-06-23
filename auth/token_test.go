@@ -27,6 +27,16 @@ func (m *MockTokenDatabase) CheckTokenLogin(ctx context.Context, token string) (
 	return args.Bool(0), args.String(1), args.Error(2)
 }
 
+func (m *MockTokenDatabase) StoreRefreshToken(ctx context.Context, userID string, token string) error {
+	args := m.Called(ctx, userID, token)
+	return args.Error(0)
+}
+
+func (m *MockTokenDatabase) GetPatreonIDFromUserID(ctx context.Context, userID string) (string, error) {
+	args := m.Called(ctx, userID)
+	return args.String(0), args.Error(1)
+}
+
 func TestStartTokenLogin_Success(t *testing.T) {
 	mockDB := new(MockTokenDatabase)
 	tokenLogin := &TokenLogin{db: mockDB}
@@ -65,6 +75,8 @@ func TestCheckTokenStatus_Success(t *testing.T) {
 	mockDB := new(MockTokenDatabase)
 	tokenLogin := &TokenLogin{db: mockDB}
 	mockDB.On("CheckTokenLogin", mock.Anything, "sometoken").Return(true, "test_user_123", nil)
+	mockDB.On("GetPatreonIDFromUserID", mock.Anything, "test_user_123").Return("test_patreon_123", nil)
+	mockDB.On("StoreRefreshToken", mock.Anything, "test_patreon_123", mock.Anything).Return(nil)
 
 	req := httptest.NewRequest("GET", "/auth/token/status?token=sometoken", nil)
 	w := httptest.NewRecorder()
@@ -76,7 +88,8 @@ func TestCheckTokenStatus_Success(t *testing.T) {
 	err := json.NewDecoder(w.Body).Decode(&resp)
 	assert.NoError(t, err)
 	assert.Equal(t, true, resp.Fulfilled)
-	assert.NotEmpty(t, resp.Token) // Should have JWT token when fulfilled
+	assert.NotEmpty(t, resp.Token)        // Should have JWT token when fulfilled
+	assert.NotEmpty(t, resp.RefreshToken) // Should have refresh token when fulfilled
 }
 
 func TestCheckTokenStatus_MissingToken(t *testing.T) {
@@ -121,5 +134,6 @@ func TestCheckTokenStatus_NotFulfilled(t *testing.T) {
 	err := json.NewDecoder(w.Body).Decode(&resp)
 	assert.NoError(t, err)
 	assert.Equal(t, false, resp.Fulfilled)
-	assert.Empty(t, resp.Token) // Should not have JWT token when not fulfilled
+	assert.Empty(t, resp.Token)        // Should not have JWT token when not fulfilled
+	assert.Empty(t, resp.RefreshToken) // Should not have refresh token when not fulfilled
 }

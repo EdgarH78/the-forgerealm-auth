@@ -54,41 +54,15 @@ func main() {
 	}
 	defer db.CloseDB()
 
-	// Initialize router
-	log.Printf("INFO: Setting up HTTP router and middleware")
-	r := chi.NewRouter()
-	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:30000", "https://foundry.theforgerealm.com"}, // Add your dev + prod clients
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-		ExposedHeaders:   []string{"Set-Cookie"},
-		AllowCredentials: true,
-		MaxAge:           300,
-	}))
-
-	// Middleware
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.RealIP)
-
 	patreonAuth := auth.NewPatreonAuth(&db, patreonOAuthConfig)
 	log.Printf("INFO: Initialized Patreon authentication handler")
 
 	tokenLogin := auth.NewTokenLogin(&db)
 	log.Printf("INFO: Initialized token login handler")
 
-	// Routes
-	r.Get("/", handleHome)
-	r.Get("/healthz", handleHealthz)
-	r.Get("/auth/login", patreonAuth.HandleLogin)
-	r.Get("/auth/callback", patreonAuth.HandleCallback)
-	r.Post("/auth/webhook", patreonAuth.HandleWebhook)
-	r.Post("/auth/refresh", patreonAuth.HandleRefresh)
-	r.Get("/auth/status", patreonAuth.HandleAuthStatus)
-	r.Post("/auth/token/start", tokenLogin.StartTokenLogin)
-	r.Get("/auth/token/status", tokenLogin.CheckTokenStatus)
-	log.Printf("INFO: Registered HTTP routes")
-
+	// Initialize router
+	log.Printf("INFO: Setting up HTTP router and middleware")
+	r := router(patreonAuth, tokenLogin)
 	// Server setup
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
@@ -145,6 +119,58 @@ func main() {
 	// Wait for server context to be stopped
 	<-serverCtx.Done()
 	log.Printf("INFO: Server context stopped, application exiting")
+}
+
+func isAllowedOrigin(origin string) bool {
+	// Allow localhost (dev) and any HTTP(S) origin (you can tighten later)
+	return strings.HasPrefix(origin, "http://localhost:") ||
+		strings.HasPrefix(origin, "http://127.0.0.1:") ||
+		strings.HasPrefix(origin, "https://") ||
+		strings.HasPrefix(origin, "http://")
+}
+
+func router(patreonAuth *auth.PatreonAuth, tokenLogin *auth.TokenLogin) http.Handler {
+	r := chi.NewRouter()
+
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins: []string{}, // use AllowOriginFunc instead
+		AllowOriginFunc: func(r *http.Request, origin string) bool {
+			return isAllowedOrigin(origin)
+		},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Requested-With", "Accept-Language"},
+		ExposedHeaders:   []string{"Set-Cookie"},
+		AllowCredentials: true,
+		MaxAge:           600,
+	}))
+
+	// Ensure caches vary by Origin
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Add("Vary", "Origin")
+			next.ServeHTTP(w, req)
+		})
+	})
+
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	// Optional CSRF protection for cookie-based auth
+	// r.Use(csrfProtect)
+
+	// Routes
+	r.Get("/", handleHome)
+	r.Get("/healthz", handleHealthz)
+	r.Get("/auth/login", patreonAuth.HandleLogin)
+	r.Get("/auth/callback", patreonAuth.HandleCallback)
+	r.Post("/auth/webhook", patreonAuth.HandleWebhook)
+	r.Post("/auth/refresh", patreonAuth.HandleRefresh)
+	r.Get("/auth/status", patreonAuth.HandleAuthStatus)
+	r.Post("/auth/token/start", tokenLogin.StartTokenLogin)
+	r.Get("/auth/token/status", tokenLogin.CheckTokenStatus)
+
+	return r
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {

@@ -64,13 +64,43 @@ type PatreonUserData struct {
 // PatreonIncludedAttributes represents included attributes from Patreon API
 type PatreonIncludedAttributes struct {
 	PatronStatus string `json:"patron_status"`
+	Title        string `json:"title"`
+}
+
+// CampaignData represents campaign data in relationships
+type CampaignData struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
+
+// CampaignRelationship represents campaign relationship
+type CampaignRelationship struct {
+	Data CampaignData `json:"data"`
+}
+
+// TierData represents tier data in relationships
+type TierData struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
+
+// CurrentlyEntitledTiersRelationship represents currently entitled tiers relationship
+type CurrentlyEntitledTiersRelationship struct {
+	Data []TierData `json:"data"`
+}
+
+// PatreonIncludedRelationships represents relationships in included data
+type PatreonIncludedRelationships struct {
+	Campaign               CampaignRelationship               `json:"campaign"`
+	CurrentlyEntitledTiers CurrentlyEntitledTiersRelationship `json:"currently_entitled_tiers"`
 }
 
 // PatreonIncluded represents included data from Patreon API
 type PatreonIncluded struct {
-	Type       string                    `json:"type"`
-	ID         string                    `json:"id"`
-	Attributes PatreonIncludedAttributes `json:"attributes"`
+	Type          string                       `json:"type"`
+	ID            string                       `json:"id"`
+	Attributes    PatreonIncludedAttributes    `json:"attributes"`
+	Relationships PatreonIncludedRelationships `json:"relationships"`
 }
 
 // PatreonIdentityResponse represents the Patreon identity API response
@@ -189,6 +219,7 @@ func (a *PatreonAuth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if token != "" {
 		url = a.patreonOAuthConfig.AuthCodeURL(token, oauth2.AccessTypeOffline)
 	}
+	log.Printf("DEBUG: Redirecting to Patreon OAuth URL: %s", url)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
@@ -210,14 +241,26 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	client := a.patreonOAuthConfig.Client(context.Background(), token)
 
-	// Get identity info with memberships and patron_status
-	resp, err := client.Get("https://www.patreon.com/api/oauth2/v2/identity?include=memberships&fields[user]=email,first_name,last_name&fields[member]=patron_status")
+	// Call identity with the relationships/fields you actually need
+	resp, err := client.Get(
+		"https://www.patreon.com/api/oauth2/v2/identity" +
+			"?include=memberships,memberships.campaign,memberships.currently_entitled_tiers" +
+			"&fields[user]=email,first_name,last_name" +
+			"&fields[member]=patron_status" +
+			"&fields[tier]=title")
 	if err != nil {
 		log.Printf("ERROR: Failed to get user info from Patreon API: %v", err)
 		http.Error(w, "Failed to get user info: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		log.Printf("ERROR: Patreon identity returned %d: %s", resp.StatusCode, string(b))
+		http.Error(w, "Patreon identity error", http.StatusBadGateway)
+		return
+	}
 
 	body, _ := io.ReadAll(resp.Body)
 	log.Printf("DEBUG: Raw Patreon user JSON: %s", string(body))
@@ -235,16 +278,78 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	firstName := result.Data.Attributes.FirstName
 	lastName := result.Data.Attributes.LastName
 
-	// Check if user is an active patron
-	if len(result.Included) > 0 && result.Included[0].Attributes.PatronStatus == "active_patron" {
-		// User is an active patron, proceed with authentication
-	} else {
+	// Check if user is an active patron of YOUR specific campaign
+	const forgeRealmCampaignID = "14358641"
+
+	isActivePatron := false
+	var activeMembershipID string
+
+	// First, let's log all memberships to see the campaign data structure
+	log.Printf("DEBUG: All memberships: %+v", result.Included)
+
+	// Index included by (type,id) for quick lookup
+	typeKey := func(t, id string) string { return t + ":" + id }
+	inc := make(map[string]PatreonIncluded)
+	for _, x := range result.Included {
+		inc[typeKey(x.Type, x.ID)] = x
+	}
+
+	// Walk the membership references on the user and find the one for YOUR campaign
+	tierTitle := "free" // sensible default
+	var patronStatus string
+
+	memRefs := result.Data.Relationships.Memberships.Data // []Ref{ {id,type:"member"} ... }
+	for _, ref := range memRefs {
+		m, ok := inc[typeKey("member", ref.ID)]
+		if !ok {
+			continue // this means you didn't ask for include=memberships
+		}
+
+		// Find the campaign of this membership
+		campRef := m.Relationships.Campaign.Data
+		if campRef.ID != forgeRealmCampaignID {
+			continue
+		}
+
+		// Check status + (optionally) payment info
+		status := m.Attributes.PatronStatus // "active_patron" | "declined_patron" | "former_patron" | null
+		if status != "active_patron" {
+			continue
+		}
+
+		// Pull tier title if present (first entitled tier)
+		if len(m.Relationships.CurrentlyEntitledTiers.Data) > 0 {
+			tierRef := m.Relationships.CurrentlyEntitledTiers.Data[0] // pick the first
+			if t, ok := inc[typeKey("tier", tierRef.ID)]; ok {
+				if t.Attributes.Title != "" {
+					tierTitle = strings.ToLower(t.Attributes.Title) // e.g., "apprentice"
+				}
+			}
+		}
+
+		isActivePatron = true
+		activeMembershipID = m.ID
+		patronStatus = status
+		break
+	}
+
+	if !isActivePatron {
+		log.Printf("INFO: User %s is not an active patron of campaign %s", userID, forgeRealmCampaignID)
 		http.Error(w, "You must be a patron to access this feature.", http.StatusForbidden)
 		return
 	}
 
-	tierTitle := "apprentice" // Default tier for active patrons
-	patronStatus := "active_patron"
+	log.Printf("INFO: User %s is an active patron (membership %s) of campaign %s, tier=%s",
+		userID, activeMembershipID, forgeRealmCampaignID, tierTitle,
+	)
+
+	if tierTitle == "" {
+		tierTitle = "apprentice" // Default tier for active patrons
+	}
+
+	if patronStatus == "" {
+		patronStatus = "active_patron"
+	}
 
 	tokenExpiresAt := defaultExpiry(24)
 	err = a.db.SaveUser(

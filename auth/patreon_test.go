@@ -338,6 +338,29 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 											"id": "membership_123",
 											"attributes": {
 												"patron_status": "active_patron"
+											},
+											"relationships": {
+												"campaign": {
+													"data": {
+														"id": "14358641",
+														"type": "campaign"
+													}
+												},
+												"currently_entitled_tiers": {
+													"data": [
+														{
+															"id": "tier_1",
+															"type": "tier"
+														}
+													]
+												}
+											}
+										},
+										{
+											"type": "tier",
+											"id": "tier_1",
+											"attributes": {
+												"title": "Apprentice"
 											}
 										}
 									]
@@ -391,6 +414,29 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 											"id": "membership_456",
 											"attributes": {
 												"patron_status": "active_patron"
+											},
+											"relationships": {
+												"campaign": {
+													"data": {
+														"id": "14358641",
+														"type": "campaign"
+													}
+												},
+												"currently_entitled_tiers": {
+													"data": [
+														{
+															"id": "tier_1",
+															"type": "tier"
+														}
+													]
+												}
+											}
+										},
+										{
+											"type": "tier",
+											"id": "tier_1",
+											"attributes": {
+												"title": "Apprentice"
 											}
 										}
 									]
@@ -490,7 +536,7 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 			},
 			mockDB:         &MockDatabase{},
 			expectedStatus: http.StatusInternalServerError,
-			expectedBody:   "Failed to get user info: Get \"https://www.patreon.com/api/oauth2/v2/identity?include=memberships&fields[user]=email,first_name,last_name&fields[member]=patron_status\": network error",
+			expectedBody:   "Failed to get user info: Get \"https://www.patreon.com/api/oauth2/v2/identity?include=memberships,memberships.campaign,memberships.currently_entitled_tiers&fields[user]=email,first_name,last_name&fields[member]=patron_status&fields[tier]=title\": network error",
 		},
 		{
 			name:  "invalid_json_response",
@@ -555,6 +601,29 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 											"id": "membership_123",
 											"attributes": {
 												"patron_status": "active_patron"
+											},
+											"relationships": {
+												"campaign": {
+													"data": {
+														"id": "14358641",
+														"type": "campaign"
+													}
+												},
+												"currently_entitled_tiers": {
+													"data": [
+														{
+															"id": "tier_1",
+															"type": "tier"
+														}
+													]
+												}
+											}
+										},
+										{
+											"type": "tier",
+											"id": "tier_1",
+											"attributes": {
+												"title": "Apprentice"
 											}
 										}
 									]
@@ -607,6 +676,29 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 											"id": "membership_123",
 											"attributes": {
 												"patron_status": "active_patron"
+											},
+											"relationships": {
+												"campaign": {
+													"data": {
+														"id": "14358641",
+														"type": "campaign"
+													}
+												},
+												"currently_entitled_tiers": {
+													"data": [
+														{
+															"id": "tier_1",
+															"type": "tier"
+														}
+													]
+												}
+											}
+										},
+										{
+											"type": "tier",
+											"id": "tier_1",
+											"attributes": {
+												"title": "Apprentice"
 											}
 										}
 									]
@@ -659,6 +751,29 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 											"id": "membership_123",
 											"attributes": {
 												"patron_status": "active_patron"
+											},
+											"relationships": {
+												"campaign": {
+													"data": {
+														"id": "14358641",
+														"type": "campaign"
+													}
+												},
+												"currently_entitled_tiers": {
+													"data": [
+														{
+															"id": "tier_1",
+															"type": "tier"
+														}
+													]
+												}
+											}
+										},
+										{
+											"type": "tier",
+											"id": "tier_1",
+											"attributes": {
+												"title": "Apprentice"
 											}
 										}
 									]

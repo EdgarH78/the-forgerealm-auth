@@ -35,6 +35,8 @@ func main() {
 		PATREON_REDIRECT_URL = "https://theforgerealm.com/auth/callback"
 	}
 
+	log.Printf("INFO: Using Patreon redirect URL: %s", PATREON_REDIRECT_URL)
+
 	patreonOAuthConfig := &oauth2.Config{
 		ClientID:     strings.TrimSpace(os.Getenv("PATREON_CLIENT_ID")),
 		ClientSecret: strings.TrimSpace(os.Getenv("PATREON_CLIENT_SECRET")),

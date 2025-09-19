@@ -681,6 +681,29 @@ func TestE2E_HandleCallback_WithRealDatabase(t *testing.T) {
 											"id": "membership_123",
 											"attributes": {
 												"patron_status": "active_patron"
+											},
+											"relationships": {
+												"campaign": {
+													"data": {
+														"id": "14358641",
+														"type": "campaign"
+													}
+												},
+												"currently_entitled_tiers": {
+													"data": [
+														{
+															"id": "tier_1",
+															"type": "tier"
+														}
+													]
+												}
+											}
+										},
+										{
+											"type": "tier",
+											"id": "tier_1",
+											"attributes": {
+												"title": "Apprentice"
 											}
 										}
 									]

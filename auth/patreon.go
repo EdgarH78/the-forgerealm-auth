@@ -279,7 +279,6 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	lastName := result.Data.Attributes.LastName
 
 	// Check if user is an active patron of YOUR specific campaign
-	// TODO: You need to set your actual Patreon campaign ID here
 	const forgeRealmCampaignID = "14358641"
 
 	isActivePatron := false

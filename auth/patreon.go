@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -213,12 +214,24 @@ func NewPatreonAuth(db PatreonAuthDb, patreonOAuthConfig OAuth2Config) *PatreonA
 }
 
 // HandlePatreonLogin initiates the Patreon OAuth2 flow
+//
+// Query params:
+//   - token: UUID for token-based (polling) login flow
+//   - app:   client app identifier (e.g. "atlasforge") — triggers redirect-based flow
 func (a *PatreonAuth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
-	url := a.patreonOAuthConfig.AuthCodeURL("state", oauth2.AccessTypeOffline)
+	app := r.URL.Query().Get("app")
+
+	state := "state"
 	if token != "" {
-		url = a.patreonOAuthConfig.AuthCodeURL(token, oauth2.AccessTypeOffline)
+		state = token
 	}
+	// Encode app into state so HandleCallback knows where to redirect
+	if app != "" {
+		state = "app:" + app + ":" + state
+	}
+
+	url := a.patreonOAuthConfig.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	log.Printf("DEBUG: Redirecting to Patreon OAuth URL: %s", url)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
@@ -369,11 +382,23 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to save user: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	login_token := r.URL.Query().Get("state")
-	if login_token == "" {
+	// Parse state parameter — may contain app prefix: "app:<name>:<inner_state>"
+	rawState := r.URL.Query().Get("state")
+	var appName string
+	loginToken := rawState
+
+	if strings.HasPrefix(rawState, "app:") {
+		parts := strings.SplitN(rawState, ":", 3)
+		if len(parts) == 3 {
+			appName = parts[1]
+			loginToken = parts[2]
+		}
+	}
+
+	if loginToken == "" {
 		log.Println("No login token (state param) returned in OAuth callback")
-	} else if login_token != "state" {
-		err = a.db.FulfillTokenLogin(r.Context(), login_token, userID)
+	} else if loginToken != "state" {
+		err = a.db.FulfillTokenLogin(r.Context(), loginToken, userID)
 		if err != nil {
 			log.Printf("ERROR: Failed to fulfill token login (Patreon ID: %s): %v", userID, err)
 			http.Error(w, "Failed to fulfill token login: "+err.Error(), http.StatusInternalServerError)
@@ -395,6 +420,19 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("INFO: Successfully authenticated Patreon user ID: %s", userID)
+
+	// App-based login: redirect back to the app with tokens in query params
+	if appName != "" {
+		redirectURL := appRedirectURL(appName, jwtToken, refreshToken)
+		if redirectURL != "" {
+			log.Printf("INFO: Redirecting authenticated user to app: %s", appName)
+			http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+			return
+		}
+		log.Printf("WARN: Unknown app '%s', falling back to JSON response", appName)
+	}
+
+	// Default: return JSON response (ScryForge / token-polling flow)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	response := AuthResponse{
@@ -494,6 +532,19 @@ func (a *PatreonAuth) HandleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+}
+
+// appRedirectURL returns the post-login redirect URL for a known app.
+// Tokens are passed as URL-safe query params; the app's callback page reads them.
+func appRedirectURL(appName, jwtToken, refreshToken string) string {
+	knownApps := map[string]string{
+		"atlasforge": "https://theforgerealm.com/atlasforge/auth/callback",
+	}
+	base, ok := knownApps[appName]
+	if !ok {
+		return ""
+	}
+	return base + "?token=" + url.QueryEscape(jwtToken) + "&refresh_token=" + url.QueryEscape(refreshToken)
 }
 
 func generateSecureRandomToken() string {

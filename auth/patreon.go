@@ -191,6 +191,7 @@ type PatreonAuthDb interface {
 	VerifyRefreshToken(ctx context.Context, token string) (string, error)
 	StoreRefreshToken(ctx context.Context, patreonID, token string) error
 	GetTierCodeForUser(ctx context.Context, patreonID string) (string, error)
+	GetUserIDForPatreon(ctx context.Context, patreonID string) (string, error)
 	FulfillTokenLogin(ctx context.Context, token string, userID string) error
 }
 
@@ -406,7 +407,15 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jwtToken, err := generateJWT(userID, tierTitle)
+	// Look up the database UUID for this Patreon user
+	dbUserID, err := a.db.GetUserIDForPatreon(r.Context(), userID)
+	if err != nil {
+		log.Printf("ERROR: Failed to get database user ID for Patreon ID %s: %v", userID, err)
+		http.Error(w, "Failed to resolve user ID", http.StatusInternalServerError)
+		return
+	}
+
+	jwtToken, err := generateJWT(dbUserID, tierTitle)
 	if err != nil {
 		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -471,7 +480,15 @@ func (a *PatreonAuth) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	// Get tier info from DB (if needed)
 	tierCode, _ := a.db.GetTierCodeForUser(r.Context(), patreonID)
 
-	newJWT, err := generateJWT(patreonID, tierCode)
+	// Look up the database UUID for this Patreon user
+	dbUserID, err := a.db.GetUserIDForPatreon(r.Context(), patreonID)
+	if err != nil {
+		log.Printf("ERROR: Failed to get database user ID for Patreon ID %s: %v", patreonID, err)
+		http.Error(w, "Failed to resolve user ID", http.StatusInternalServerError)
+		return
+	}
+
+	newJWT, err := generateJWT(dbUserID, tierCode)
 	if err != nil {
 		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return

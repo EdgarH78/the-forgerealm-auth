@@ -246,6 +246,25 @@ func hashToken(token string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// GetUserIDForPatreon retrieves the database UUID for a given Patreon ID
+func (db *PostgresDB) GetUserIDForPatreon(ctx context.Context, patreonID string) (string, error) {
+	query := `
+		SELECT id::text
+		FROM forgerealm_auth.users
+		WHERE patreon_id = $1
+	`
+
+	var userID string
+	err := db.pool.QueryRow(ctx, query, patreonID).Scan(&userID)
+	if err != nil {
+		log.Printf("ERROR: Failed to get user ID for Patreon ID %s: %v", patreonID, err)
+		return "", err
+	}
+
+	log.Printf("INFO: Successfully retrieved user ID '%s' for Patreon ID: %s", userID, patreonID)
+	return userID, nil
+}
+
 // GetPatreonIDFromUserID retrieves the Patreon ID for a given database user ID
 func (db *PostgresDB) GetPatreonIDFromUserID(ctx context.Context, userID string) (string, error) {
 	query := `

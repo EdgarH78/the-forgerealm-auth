@@ -510,7 +510,7 @@ func generateJWT(patreonID, tierCode string) (string, error) {
 	claims := jwt.MapClaims{
 		"sub":  patreonID,
 		"tier": tierCode,
-		"exp":  time.Now().Add(1 * time.Hour).Unix(),
+		"exp":  time.Now().Add(4 * time.Hour).Unix(),
 		"iat":  time.Now().Unix(),
 		"iss":  "forgerealm-auth",
 	}

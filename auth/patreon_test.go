@@ -75,6 +75,11 @@ func (m *MockDatabase) FulfillTokenLogin(ctx context.Context, token string, user
 	return args.Error(0)
 }
 
+func (m *MockDatabase) GetUserIDForPatreon(ctx context.Context, patreonID string) (string, error) {
+	args := m.Called(ctx, patreonID)
+	return args.String(0), args.Error(1)
+}
+
 // MockOAuth2Config mocks the OAuth2 config for testing
 type MockOAuth2Config struct {
 	exchangeFunc    func(code string) (*oauth2.Token, error)
@@ -249,7 +254,15 @@ func (a *TestPatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	jwtToken, err := generateJWT(userID, tierTitle)
+	// Look up the database UUID for this Patreon user
+	dbUserID, err := a.db.GetUserIDForPatreon(r.Context(), userID)
+	if err != nil {
+		log.Printf("ERROR: Failed to get database user ID for Patreon ID %s: %v", userID, err)
+		http.Error(w, "Failed to resolve user ID", http.StatusInternalServerError)
+		return
+	}
+
+	jwtToken, err := generateJWT(dbUserID, tierTitle)
 	if err != nil {
 		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -801,6 +814,7 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 			// Set up mock expectations for database calls
 			if strings.Contains(tt.name, "successful_authentication") {
 				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				tt.mockDB.On("GetUserIDForPatreon", mock.Anything, mock.Anything).Return("test-uuid-1234", nil)
 				tt.mockDB.On("StoreRefreshToken", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 				// Only expect FulfillTokenLogin if state is not "state" and not empty
 				if strings.Contains(tt.name, "token_login") && tt.state != "state" && tt.state != "" {
@@ -813,6 +827,7 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 				tt.mockDB.On("FulfillTokenLogin", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("token login error"))
 			} else if strings.Contains(tt.name, "store_refresh_token_failure") {
 				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				tt.mockDB.On("GetUserIDForPatreon", mock.Anything, mock.Anything).Return("test-uuid-1234", nil)
 				tt.mockDB.On("StoreRefreshToken", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("refresh token error"))
 			}
 

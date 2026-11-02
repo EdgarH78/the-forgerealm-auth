@@ -86,7 +86,7 @@ func setAdminEnv(t *testing.T) {
 }
 
 func exchange(a *Admin, bearer string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest("POST", "/admin/token", nil)
+	req := httptest.NewRequest("POST", "/auth/admin/token", nil)
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
@@ -96,7 +96,7 @@ func exchange(a *Admin, bearer string) *httptest.ResponseRecorder {
 }
 
 func lookup(a *Admin, bearer, query string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest("GET", "/admin/users?"+query, nil)
+	req := httptest.NewRequest("GET", "/auth/admin/users?"+query, nil)
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}

@@ -173,8 +173,8 @@ func router(patreonAuth *auth.PatreonAuth, tokenLogin *auth.TokenLogin, admin *a
 	r.Get("/auth/status", patreonAuth.HandleAuthStatus)
 	r.Post("/auth/token/start", tokenLogin.StartTokenLogin)
 	r.Get("/auth/token/status", tokenLogin.CheckTokenStatus)
-	r.Post("/admin/token", admin.HandleToken)
-	r.Get("/admin/users", admin.HandleUsers)
+	r.Post("/auth/admin/token", admin.HandleToken)
+	r.Get("/auth/admin/users", admin.HandleUsers)
 
 	return r
 }

@@ -14,7 +14,7 @@ import (
 // Authorization header (PR-12b D7).
 func TestCORS_AdminRoutesAllowEditorOrigin(t *testing.T) {
 	r := router(auth.NewPatreonAuth(nil, nil), auth.NewTokenLogin(nil), auth.NewAdmin(nil))
-	for _, route := range []struct{ method, path string }{{"POST", "/admin/token"}, {"GET", "/admin/users"}} {
+	for _, route := range []struct{ method, path string }{{"POST", "/auth/admin/token"}, {"GET", "/auth/admin/users"}} {
 		req := httptest.NewRequest("OPTIONS", route.path, nil)
 		req.Header.Set("Origin", "https://editor.example.com")
 		req.Header.Set("Access-Control-Request-Method", route.method)

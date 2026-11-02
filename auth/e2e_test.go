@@ -129,6 +129,14 @@ func runMigrations(pool *pgxpool.Pool) error {
 		return fmt.Errorf("failed to execute third migration: %v", err)
 	}
 
+	migrationSQL4, err := os.ReadFile("../scripts/004_roles.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration file 4: %v", err)
+	}
+	if _, err = pool.Exec(context.Background(), string(migrationSQL4)); err != nil {
+		return fmt.Errorf("failed to execute fourth migration: %v", err)
+	}
+
 	return nil
 }
 

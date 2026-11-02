@@ -61,6 +61,7 @@ go run main.go
 - `PATREON_CLIENT_SECRET`: Patreon OAuth2 client secret
 - `JWT_SECRET_CURRENT`: Secret key for JWT token signing
 - `WEB_HOOK_SECRET`: Secret for webhook signature verification
+- `ADMIN_JWT_SECRET`: Secret for admin tokens (`/admin/token`, `/admin/users`). Without it both answer 503
 
 ### Optional Variables
 - `PORT`: Server port (default: 8080)

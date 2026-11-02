@@ -62,9 +62,11 @@ func main() {
 	tokenLogin := auth.NewTokenLogin(&db)
 	log.Printf("INFO: Initialized token login handler")
 
+	admin := auth.NewAdmin(&db)
+
 	// Initialize router
 	log.Printf("INFO: Setting up HTTP router and middleware")
-	r := router(patreonAuth, tokenLogin)
+	r := router(patreonAuth, tokenLogin, admin)
 	// Server setup
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
@@ -131,7 +133,7 @@ func isAllowedOrigin(origin string) bool {
 		strings.HasPrefix(origin, "http://")
 }
 
-func router(patreonAuth *auth.PatreonAuth, tokenLogin *auth.TokenLogin) http.Handler {
+func router(patreonAuth *auth.PatreonAuth, tokenLogin *auth.TokenLogin, admin *auth.Admin) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(cors.Handler(cors.Options{
@@ -171,6 +173,8 @@ func router(patreonAuth *auth.PatreonAuth, tokenLogin *auth.TokenLogin) http.Han
 	r.Get("/auth/status", patreonAuth.HandleAuthStatus)
 	r.Post("/auth/token/start", tokenLogin.StartTokenLogin)
 	r.Get("/auth/token/status", tokenLogin.CheckTokenStatus)
+	r.Post("/admin/token", admin.HandleToken)
+	r.Get("/admin/users", admin.HandleUsers)
 
 	return r
 }

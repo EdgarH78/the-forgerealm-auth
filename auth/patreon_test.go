@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 
+	"forgerealm-auth/db"
+
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 )
 
@@ -34,7 +36,7 @@ func TestMain(m *testing.M) {
 func setupTestEnv() {
 	// Set required environment variables for tests
 	os.Setenv("JWT_SECRET_CURRENT", "test_jwt_secret_key_for_testing")
-	os.Setenv("WEBHOOK_SECRET", "test_webhook_secret_for_testing")
+	os.Setenv("WEB_HOOK_SECRET", "test_webhook_secret_for_testing")
 	os.Setenv("PATREON_CLIENT_ID", "test_client_id")
 	os.Setenv("PATREON_CLIENT_SECRET", "test_client_secret")
 	os.Setenv("PATREON_REDIRECT_URL", "http://localhost:8080/auth/callback")
@@ -50,14 +52,9 @@ func (m *MockDatabase) SaveUser(ctx context.Context, patreonID, email, givenName
 	return args.Error(0)
 }
 
-func (m *MockDatabase) SaveWebhookEvent(ctx context.Context, eventTypeID, patreonID, tierID, patronStatus string, rawPayload []byte) error {
-	args := m.Called(ctx, eventTypeID, patreonID, tierID, patronStatus, rawPayload)
+func (m *MockDatabase) RecordWebhook(ctx context.Context, rec db.WebhookRecord) error {
+	args := m.Called(ctx, rec)
 	return args.Error(0)
-}
-
-func (m *MockDatabase) GetTierCodeForUser(ctx context.Context, patreonID string) (string, error) {
-	args := m.Called(ctx, patreonID)
-	return args.String(0), args.Error(1)
 }
 
 func (m *MockDatabase) StoreRefreshToken(ctx context.Context, patreonID, token string) error {
@@ -65,7 +62,7 @@ func (m *MockDatabase) StoreRefreshToken(ctx context.Context, patreonID, token s
 	return args.Error(0)
 }
 
-func (m *MockDatabase) VerifyRefreshToken(ctx context.Context, token string) (string, error) {
+func (m *MockDatabase) RotateRefreshToken(ctx context.Context, token string) (string, error) {
 	args := m.Called(ctx, token)
 	return args.String(0), args.Error(1)
 }
@@ -75,9 +72,9 @@ func (m *MockDatabase) FulfillTokenLogin(ctx context.Context, token string, user
 	return args.Error(0)
 }
 
-func (m *MockDatabase) GetUserIDForPatreon(ctx context.Context, patreonID string) (string, error) {
+func (m *MockDatabase) GetUserAccount(ctx context.Context, patreonID string) (db.UserAccount, error) {
 	args := m.Called(ctx, patreonID)
-	return args.String(0), args.Error(1)
+	return args.Get(0).(db.UserAccount), args.Error(1)
 }
 
 // MockOAuth2Config mocks the OAuth2 config for testing
@@ -134,175 +131,6 @@ func (m *MockHTTPClientWrapper) RoundTrip(req *http.Request) (*http.Response, er
 	return m.Do(req)
 }
 
-// TestPatreonAuth is a test-specific version of PatreonAuth that can accept mocks
-type TestPatreonAuth struct {
-	patreonOAuthConfig *MockOAuth2Config
-	db                 PatreonAuthDb
-}
-
-func NewTestPatreonAuth(db PatreonAuthDb, mockOAuthConfig *MockOAuth2Config) *TestPatreonAuth {
-	return &TestPatreonAuth{
-		patreonOAuthConfig: mockOAuthConfig,
-		db:                 db,
-	}
-}
-
-// HandleCallback is the test version that uses the mock OAuth config
-func (a *TestPatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		log.Printf("ERROR: OAuth callback missing code parameter")
-		http.Error(w, "Code not found", http.StatusBadRequest)
-		return
-	}
-
-	token, err := a.patreonOAuthConfig.Exchange(context.Background(), code)
-	if err != nil {
-		log.Printf("ERROR: Failed to exchange OAuth token: %v", err)
-		http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	client := a.patreonOAuthConfig.Client(context.Background(), token)
-
-	// Get identity info with memberships and patron_status
-	resp, err := client.Get("https://www.patreon.com/api/oauth2/v2/identity?include=memberships&fields[user]=email,first_name,last_name&fields[member]=patron_status")
-	if err != nil {
-		log.Printf("ERROR: Failed to get user info from Patreon API: %v", err)
-		http.Error(w, "Failed to get user info: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	log.Printf("DEBUG: Raw Patreon user JSON: %s", string(body))
-
-	var result struct {
-		Data struct {
-			ID         string `json:"id"`
-			Attributes struct {
-				Email     string `json:"email"`
-				FirstName string `json:"first_name"`
-				LastName  string `json:"last_name"`
-			} `json:"attributes"`
-			Relationships struct {
-				Memberships struct {
-					Data []struct {
-						ID string `json:"id"`
-					} `json:"data"`
-				} `json:"memberships"`
-			} `json:"relationships"`
-		} `json:"data"`
-		Included []struct {
-			Type       string `json:"type"`
-			ID         string `json:"id"`
-			Attributes struct {
-				PatronStatus string `json:"patron_status"`
-			} `json:"attributes"`
-		} `json:"included"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("ERROR: Failed to parse identity JSON: %v", err)
-		http.Error(w, "Failed to parse identity info", http.StatusInternalServerError)
-		return
-	}
-
-	userID := result.Data.ID
-	email := result.Data.Attributes.Email
-	firstName := result.Data.Attributes.FirstName
-	lastName := result.Data.Attributes.LastName
-
-	// Check if user is an active patron
-	if len(result.Included) > 0 && result.Included[0].Attributes.PatronStatus == "active_patron" {
-		// User is an active patron, proceed with authentication
-	} else {
-		http.Error(w, "You must be a patron to access this feature.", http.StatusForbidden)
-		return
-	}
-
-	tierTitle := "apprentice" // Default tier for active patrons
-	patronStatus := "active_patron"
-
-	tokenExpiresAt := defaultExpiry(24)
-	err = a.db.SaveUser(
-		context.Background(),
-		userID,
-		email,
-		firstName,
-		lastName,
-		tierTitle,
-		patronStatus,
-		token.AccessToken,
-		token.RefreshToken,
-		tokenExpiresAt,
-	)
-	if err != nil {
-		log.Printf("ERROR: Failed to save user to database (Patreon ID: %s): %v", userID, err)
-		http.Error(w, "Failed to save user: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	login_token := r.URL.Query().Get("state")
-	if login_token == "" {
-		log.Println("No login token (state param) returned in OAuth callback")
-	} else if login_token != "state" {
-		err = a.db.FulfillTokenLogin(r.Context(), login_token, userID)
-		if err != nil {
-			log.Printf("ERROR: Failed to fulfill token login (Patreon ID: %s): %v", userID, err)
-			http.Error(w, "Failed to fulfill token login: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-
-	// Look up the database UUID for this Patreon user
-	dbUserID, err := a.db.GetUserIDForPatreon(r.Context(), userID)
-	if err != nil {
-		log.Printf("ERROR: Failed to get database user ID for Patreon ID %s: %v", userID, err)
-		http.Error(w, "Failed to resolve user ID", http.StatusInternalServerError)
-		return
-	}
-
-	jwtToken, err := generateJWT(dbUserID, tierTitle)
-	if err != nil {
-		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
-		return
-	}
-
-	refreshToken := generateSecureRandomToken()
-	err = a.db.StoreRefreshToken(r.Context(), userID, refreshToken)
-	if err != nil {
-		http.Error(w, "Failed to store refresh token", http.StatusInternalServerError)
-		return
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     "scryforge_auth",
-		Value:    jwtToken,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   3600,
-	})
-	http.SetCookie(w, &http.Cookie{
-		Name:     "scryforge_refresh",
-		Value:    refreshToken,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   30 * 24 * 3600,
-	})
-
-	log.Printf("INFO: Successfully authenticated Patreon user ID: %s", userID)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write([]byte(`{"status":"ok","message":"authenticated"}`)); err != nil {
-		log.Printf("ERROR: Failed to write response: %v", err)
-	}
-}
-
-// TestHandleCallback_CompleteFlow tests the complete HandleCallback flow with mocked dependencies
 func TestHandleCallback_CompleteFlow(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -814,7 +642,7 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 			// Set up mock expectations for database calls
 			if strings.Contains(tt.name, "successful_authentication") {
 				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-				tt.mockDB.On("GetUserIDForPatreon", mock.Anything, mock.Anything).Return("test-uuid-1234", nil)
+				tt.mockDB.On("GetUserAccount", mock.Anything, mock.Anything).Return(db.UserAccount{ID: "test-uuid-1234", PatreonID: "test_user_123", TierID: "apprentice", PatronStatus: "active_patron"}, nil)
 				tt.mockDB.On("StoreRefreshToken", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 				// Only expect FulfillTokenLogin if state is not "state" and not empty
 				if strings.Contains(tt.name, "token_login") && tt.state != "state" && tt.state != "" {
@@ -824,10 +652,11 @@ func TestHandleCallback_CompleteFlow(t *testing.T) {
 				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("database error"))
 			} else if strings.Contains(tt.name, "fulfill_token_login_failure") {
 				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+				tt.mockDB.On("GetUserAccount", mock.Anything, mock.Anything).Return(db.UserAccount{ID: "test-uuid-1234", PatreonID: "test_user_123", TierID: "apprentice", PatronStatus: "active_patron"}, nil)
 				tt.mockDB.On("FulfillTokenLogin", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("token login error"))
 			} else if strings.Contains(tt.name, "store_refresh_token_failure") {
 				tt.mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-				tt.mockDB.On("GetUserIDForPatreon", mock.Anything, mock.Anything).Return("test-uuid-1234", nil)
+				tt.mockDB.On("GetUserAccount", mock.Anything, mock.Anything).Return(db.UserAccount{ID: "test-uuid-1234", PatreonID: "test_user_123", TierID: "apprentice", PatronStatus: "active_patron"}, nil)
 				tt.mockDB.On("StoreRefreshToken", mock.Anything, mock.Anything, mock.Anything).Return(fmt.Errorf("refresh token error"))
 			}
 
@@ -931,4 +760,85 @@ func TestPatreonAuth_HandleLogin(t *testing.T) {
 
 	assert.Equal(t, http.StatusTemporaryRedirect, w.Code)
 	assert.Contains(t, w.Header().Get("Location"), "https://www.patreon.com/oauth2/authorize")
+}
+
+// identityWith returns a Patreon identity response with one membership of the
+// Forge Realm campaign. Empty status is sent as null; empty tier means none entitled.
+func identityWith(status, tierTitle string) string {
+	statusJSON := "null"
+	if status != "" {
+		statusJSON = fmt.Sprintf("%q", status)
+	}
+	tiers, tierInc := `[]`, ``
+	if tierTitle != "" {
+		tiers = `[{"id": "tier_1", "type": "tier"}]`
+		tierInc = fmt.Sprintf(`, {"type": "tier", "id": "tier_1", "attributes": {"title": %q}}`, tierTitle)
+	}
+	return fmt.Sprintf(`{
+		"data": {"id": "lapsed_user", "attributes": {"email": "l@example.com"},
+			"relationships": {"memberships": {"data": [{"id": "m1"}]}}},
+		"included": [{"type": "member", "id": "m1", "attributes": {"patron_status": %s},
+			"relationships": {"campaign": {"data": {"id": "14358641", "type": "campaign"}},
+				"currently_entitled_tiers": {"data": %s}}}%s]
+	}`, statusJSON, tiers, tierInc)
+}
+
+func callbackWithIdentity(t *testing.T, mockDB *MockDatabase, identity string) *httptest.ResponseRecorder {
+	t.Helper()
+	cfg := &MockOAuth2Config{
+		exchangeFunc: func(code string) (*oauth2.Token, error) { return &oauth2.Token{AccessToken: "a"}, nil },
+		clientFunc: func(token *oauth2.Token) *http.Client {
+			return &http.Client{Transport: &MockHTTPClientWrapper{&MockHTTPClient{
+				doFunc: func(req *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(identity))}, nil
+				},
+			}}}
+		},
+	}
+	w := httptest.NewRecorder()
+	NewPatreonAuth(mockDB, cfg).HandleCallback(w, httptest.NewRequest("GET", "/auth/callback?code=c", nil))
+	return w
+}
+
+func TestHandleCallback_AdmitsLapsedPatrons(t *testing.T) {
+	for _, tt := range []struct{ status, tier, wantTier string }{
+		{"active_patron", "Journeyman", "journeyman"},
+		{"declined_patron", "Journeyman", "journeyman"},
+		{"former_patron", "", "non_patron"},
+	} {
+		t.Run(tt.status, func(t *testing.T) {
+			mockDB := &MockDatabase{}
+			mockDB.On("SaveUser", mock.Anything, "lapsed_user", mock.Anything, mock.Anything, mock.Anything, tt.wantTier, tt.status, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+			mockDB.On("GetUserAccount", mock.Anything, "lapsed_user").Return(db.UserAccount{ID: "uuid-1", PatreonID: "lapsed_user", TierID: tt.wantTier, PatronStatus: tt.status}, nil)
+			mockDB.On("StoreRefreshToken", mock.Anything, "lapsed_user", mock.Anything).Return(nil)
+
+			w := callbackWithIdentity(t, mockDB, identityWith(tt.status, tt.tier))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var resp AuthResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			claims, err := validateJWT(resp.Token)
+			require.NoError(t, err)
+			assert.Equal(t, "uuid-1", claims["sub"])
+			assert.Equal(t, tt.wantTier, claims["tier"])
+			assert.Equal(t, tt.status, claims["patron_status"])
+			mockDB.AssertExpectations(t)
+		})
+	}
+}
+
+func TestHandleCallback_RefusesNullStatus(t *testing.T) {
+	mockDB := &MockDatabase{}
+	w := callbackWithIdentity(t, mockDB, identityWith("", ""))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	mockDB.AssertNotCalled(t, "SaveUser")
+}
+
+func TestHandleCallback_RefusesClosedAccount(t *testing.T) {
+	mockDB := &MockDatabase{}
+	mockDB.On("SaveUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	mockDB.On("GetUserAccount", mock.Anything, "lapsed_user").Return(db.UserAccount{ID: "uuid-1", PatreonID: "lapsed_user", Closed: true}, nil)
+
+	w := callbackWithIdentity(t, mockDB, identityWith("active_patron", "Apprentice"))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	mockDB.AssertNotCalled(t, "StoreRefreshToken")
 }

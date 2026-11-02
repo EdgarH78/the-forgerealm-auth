@@ -112,7 +112,7 @@ func (db *PostgresDB) VerifyRefreshToken(ctx context.Context, token string) (str
 	query := `
 		SELECT patreon_id
 		FROM forgerealm_auth.refresh_tokens
-		WHERE expires_at > CURRENT_TIMESTAMP AND id = $1
+		WHERE expires_at > CURRENT_TIMESTAMP AND NOT revoked AND id = $1
 	`
 
 	var patreonID string

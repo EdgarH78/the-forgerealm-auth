@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"forgerealm-auth/db"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -35,6 +37,11 @@ func (m *MockTokenDatabase) StoreRefreshToken(ctx context.Context, userID string
 func (m *MockTokenDatabase) GetPatreonIDFromUserID(ctx context.Context, userID string) (string, error) {
 	args := m.Called(ctx, userID)
 	return args.String(0), args.Error(1)
+}
+
+func (m *MockTokenDatabase) GetUserAccount(ctx context.Context, patreonID string) (db.UserAccount, error) {
+	args := m.Called(ctx, patreonID)
+	return args.Get(0).(db.UserAccount), args.Error(1)
 }
 
 func TestStartTokenLogin_Success(t *testing.T) {
@@ -76,6 +83,7 @@ func TestCheckTokenStatus_Success(t *testing.T) {
 	tokenLogin := &TokenLogin{db: mockDB}
 	mockDB.On("CheckTokenLogin", mock.Anything, "sometoken").Return(true, "test_user_123", nil)
 	mockDB.On("GetPatreonIDFromUserID", mock.Anything, "test_user_123").Return("test_patreon_123", nil)
+	mockDB.On("GetUserAccount", mock.Anything, "test_patreon_123").Return(db.UserAccount{ID: "test_user_123", PatreonID: "test_patreon_123", TierID: "journeyman", PatronStatus: "former_patron"}, nil)
 	mockDB.On("StoreRefreshToken", mock.Anything, "test_patreon_123", mock.Anything).Return(nil)
 
 	req := httptest.NewRequest("GET", "/auth/token/status?token=sometoken", nil)
@@ -136,4 +144,38 @@ func TestCheckTokenStatus_NotFulfilled(t *testing.T) {
 	assert.Equal(t, false, resp.Fulfilled)
 	assert.Empty(t, resp.Token)        // Should not have JWT token when not fulfilled
 	assert.Empty(t, resp.RefreshToken) // Should not have refresh token when not fulfilled
+}
+
+func TestCheckTokenStatus_IssuesCurrentAccount(t *testing.T) {
+	mockDB := new(MockTokenDatabase)
+	tokenLogin := &TokenLogin{db: mockDB}
+	mockDB.On("CheckTokenLogin", mock.Anything, "sometoken").Return(true, "uuid-1", nil)
+	mockDB.On("GetPatreonIDFromUserID", mock.Anything, "uuid-1").Return("p1", nil)
+	mockDB.On("GetUserAccount", mock.Anything, "p1").Return(db.UserAccount{ID: "uuid-1", PatreonID: "p1", TierID: "journeyman", PatronStatus: "former_patron"}, nil)
+	mockDB.On("StoreRefreshToken", mock.Anything, "p1", mock.Anything).Return(nil)
+
+	w := httptest.NewRecorder()
+	tokenLogin.CheckTokenStatus(w, httptest.NewRequest("GET", "/auth/token/status?token=sometoken", nil))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp TokenStatusResponse
+	assert.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	claims, err := validateJWT(resp.Token)
+	assert.NoError(t, err)
+	assert.Equal(t, "journeyman", claims["tier"])
+	assert.Equal(t, "former_patron", claims["patron_status"])
+}
+
+func TestCheckTokenStatus_RefusesClosedAccount(t *testing.T) {
+	mockDB := new(MockTokenDatabase)
+	tokenLogin := &TokenLogin{db: mockDB}
+	mockDB.On("CheckTokenLogin", mock.Anything, "sometoken").Return(true, "uuid-1", nil)
+	mockDB.On("GetPatreonIDFromUserID", mock.Anything, "uuid-1").Return("p1", nil)
+	mockDB.On("GetUserAccount", mock.Anything, "p1").Return(db.UserAccount{ID: "uuid-1", PatreonID: "p1", Closed: true}, nil)
+
+	w := httptest.NewRecorder()
+	tokenLogin.CheckTokenStatus(w, httptest.NewRequest("GET", "/auth/token/status?token=sometoken", nil))
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	mockDB.AssertNotCalled(t, "StoreRefreshToken", mock.Anything, mock.Anything, mock.Anything)
 }

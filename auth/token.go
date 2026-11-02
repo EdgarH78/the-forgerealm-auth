@@ -3,8 +3,11 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
+
+	"forgerealm-auth/db"
 
 	"github.com/google/uuid"
 )
@@ -14,6 +17,7 @@ type TokenDatabase interface {
 	CheckTokenLogin(ctx context.Context, token string) (bool, string, error)
 	StoreRefreshToken(ctx context.Context, userID string, token string) error
 	GetPatreonIDFromUserID(ctx context.Context, userID string) (string, error)
+	GetUserAccount(ctx context.Context, patreonID string) (db.UserAccount, error)
 }
 
 type TokenLogin struct {
@@ -69,29 +73,30 @@ func (t *TokenLogin) CheckTokenStatus(w http.ResponseWriter, r *http.Request) {
 		Fulfilled: fulfilled,
 	}
 
-	// If token is fulfilled, generate and return JWT token
+	// If token is fulfilled, issue tokens with the current tier and status.
+	// Closed accounts get none (ED77).
 	if fulfilled && userID != "" {
-		jwtToken, err := generateJWT(userID, "apprentice") // Default tier, can be enhanced later
-		if err != nil {
-			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
-			return
-		}
-		response.Token = jwtToken
-
-		// Get Patreon ID from user ID for storing refresh token
 		patreonID, err := t.db.GetPatreonIDFromUserID(r.Context(), userID)
 		if err != nil {
 			http.Error(w, "Failed to get user information", http.StatusInternalServerError)
 			return
 		}
-
-		// Generate a refresh token
-		refreshToken := generateSecureRandomToken()
-		err = t.db.StoreRefreshToken(r.Context(), patreonID, refreshToken)
+		account, err := t.db.GetUserAccount(r.Context(), patreonID)
 		if err != nil {
-			http.Error(w, "Failed to store refresh token", http.StatusInternalServerError)
+			log.Printf("ERROR: Failed to load account for user %s: %v", userID, err)
+			http.Error(w, "Failed to get user information", http.StatusInternalServerError)
 			return
 		}
+		if account.Closed {
+			http.Error(w, "Account closed", http.StatusForbidden)
+			return
+		}
+		jwtToken, refreshToken, err := issueTokens(r.Context(), t.db, account)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		response.Token = jwtToken
 		response.RefreshToken = refreshToken
 	}
 

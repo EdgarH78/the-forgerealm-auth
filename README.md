@@ -60,7 +60,7 @@ go run main.go
 - `PATREON_CLIENT_ID`: Patreon OAuth2 client ID
 - `PATREON_CLIENT_SECRET`: Patreon OAuth2 client secret
 - `JWT_SECRET_CURRENT`: Secret key for JWT token signing
-- `WEBHOOK_SECRET`: Secret for webhook signature verification
+- `WEB_HOOK_SECRET`: Secret for webhook signature verification
 
 ### Optional Variables
 - `PORT`: Server port (default: 8080)
@@ -178,7 +178,7 @@ gcloud run deploy forgerealm-auth \
   --platform managed \
   --region your-region \
   --allow-unauthenticated \
-  --set-env-vars DATABASE_URL="your-db-url",JWT_SECRET_CURRENT="your-jwt-secret",WEBHOOK_SECRET="your-webhook-secret"
+  --set-env-vars DATABASE_URL="your-db-url",JWT_SECRET_CURRENT="your-jwt-secret",WEB_HOOK_SECRET="your-webhook-secret"
 ```
 
 ## Development

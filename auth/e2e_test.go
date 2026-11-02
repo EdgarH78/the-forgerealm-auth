@@ -3,9 +3,6 @@ package auth
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -122,6 +119,14 @@ func runMigrations(pool *pgxpool.Pool) error {
 	_, err = pool.Exec(context.Background(), string(migrationSQL2))
 	if err != nil {
 		return fmt.Errorf("failed to execute second migration: %v", err)
+	}
+
+	migrationSQL3, err := os.ReadFile("../scripts/003_credit_outbox.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration file 3: %v", err)
+	}
+	if _, err = pool.Exec(context.Background(), string(migrationSQL3)); err != nil {
+		return fmt.Errorf("failed to execute third migration: %v", err)
 	}
 
 	return nil
@@ -298,96 +303,6 @@ func TestE2E_PatreonAuthFlow(t *testing.T) {
 
 		// Should fail due to invalid OAuth code
 		assert.NotEqual(t, http.StatusOK, w.Code)
-	})
-}
-
-func TestE2E_WebhookFlow(t *testing.T) {
-	tc := setupTestContainer(t)
-	defer tc.cleanup()
-
-	// Create Patreon auth handler
-	config := &oauth2.Config{
-		ClientID:     "test_client_id",
-		ClientSecret: "test_client_secret",
-		RedirectURL:  "http://localhost:8080/auth/callback",
-	}
-
-	patreonAuth := NewPatreonAuth(tc.db, config)
-
-	// Test 1: Handle webhook with valid signature
-	t.Run("HandleWebhook_ValidSignature", func(t *testing.T) {
-		// Create test webhook payload
-		webhookPayload := `{
-			"event_type": "members:create",
-			"patreon_id": "test_user_123",
-			"tier_id": "apprentice",
-			"patron_status": "active_patron",
-			"payload": {
-				"data": {
-					"attributes": {
-						"email": "test@example.com",
-						"first_name": "Test",
-						"last_name": "User"
-					},
-					"relationships": {
-						"currently_entitled_tiers": {
-							"data": [{"id": "tier_1", "type": "tier"}]
-						}
-					}
-				},
-				"included": [
-					{
-						"type": "tier",
-						"id": "tier_1",
-						"attributes": {
-							"title": "Apprentice",
-							"description": "Apprentice tier"
-						}
-					}
-				]
-			}
-		}`
-
-		// Calculate valid signature
-		secret := "test_webhook_secret_for_testing"
-		os.Setenv("WEBHOOK_SECRET", secret)
-
-		req := httptest.NewRequest("POST", "/auth/webhook", bytes.NewBufferString(webhookPayload))
-		req.Header.Set("Content-Type", "application/json")
-
-		// Calculate HMAC signature
-		h := hmac.New(md5.New, []byte(secret))
-		h.Write([]byte(webhookPayload))
-		signature := hex.EncodeToString(h.Sum(nil))
-		req.Header.Set("X-Patreon-Signature", signature)
-
-		w := httptest.NewRecorder()
-
-		patreonAuth.HandleWebhook(w, req)
-
-		assert.Equal(t, http.StatusOK, w.Code)
-	})
-
-	// Test 2: Handle webhook with invalid signature
-	t.Run("HandleWebhook_InvalidSignature", func(t *testing.T) {
-		webhookPayload := `{
-			"event_type": "members:create",
-			"patreon_id": "test_user_456",
-			"tier_id": "apprentice",
-			"patron_status": "active_patron",
-			"payload": {}
-		}`
-
-		req := httptest.NewRequest("POST", "/auth/webhook", bytes.NewBufferString(webhookPayload))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Patreon-Signature", "invalid_signature")
-
-		w := httptest.NewRecorder()
-
-		patreonAuth.HandleWebhook(w, req)
-
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
-		assert.Contains(t, w.Body.String(), "Invalid signature")
 	})
 }
 
@@ -584,7 +499,7 @@ func TestE2E_HandleAuthStatus(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		jwtToken, err := generateJWT(patreonID, tier)
+		jwtToken, err := generateJWT(patreonID, tier, "active_patron")
 		require.NoError(t, err)
 
 		req := httptest.NewRequest("GET", "/auth/status", nil)

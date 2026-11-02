@@ -1,14 +1,11 @@
 package auth
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,20 +15,13 @@ import (
 	"strings"
 	"time"
 
+	"forgerealm-auth/db"
+
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/oauth2"
 )
-
-// WebhookEvent represents a Patreon webhook event
-type WebhookEvent struct {
-	EventType    string          `json:"event_type"`
-	PatreonID    string          `json:"patreon_id"`
-	TierID       string          `json:"tier_id"`
-	PatronStatus string          `json:"patron_status"`
-	Payload      json.RawMessage `json:"payload"`
-}
 
 // PatreonUserAttributes represents user attributes from Patreon API
 type PatreonUserAttributes struct {
@@ -130,55 +120,6 @@ type AuthStatusResponse struct {
 	Tier   interface{} `json:"tier,omitempty"`
 }
 
-// MemberPledgeAttributes represents member attributes from pledge data
-type MemberPledgeAttributes struct {
-	Email        string `json:"email"`
-	FirstName    string `json:"first_name"`
-	LastName     string `json:"last_name"`
-	PatronStatus string `json:"patron_status"`
-}
-
-// EntitledTierData represents entitled tier data from pledge data
-type EntitledTierData struct {
-	ID   string `json:"id"`
-	Type string `json:"type"`
-}
-
-// CurrentlyEntitledTiers represents currently entitled tiers from pledge data
-type CurrentlyEntitledTiers struct {
-	Data []EntitledTierData `json:"data"`
-}
-
-// MemberPledgeRelationships represents member relationships from pledge data
-type MemberPledgeRelationships struct {
-	CurrentlyEntitledTiers CurrentlyEntitledTiers `json:"currently_entitled_tiers"`
-}
-
-// MemberPledgeIncludedAttributes represents included attributes from pledge data
-type MemberPledgeIncludedAttributes struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-}
-
-// MemberPledgeIncluded represents included data from pledge data
-type MemberPledgeIncluded struct {
-	Type       string                         `json:"type"`
-	ID         string                         `json:"id"`
-	Attributes MemberPledgeIncludedAttributes `json:"attributes"`
-}
-
-// MemberPledgeDataStruct represents the data field in MemberPledgeData
-type MemberPledgeDataStruct struct {
-	Attributes    MemberPledgeAttributes    `json:"attributes"`
-	Relationships MemberPledgeRelationships `json:"relationships"`
-}
-
-// MemberPledgeData represents the data structure for member events
-type MemberPledgeData struct {
-	Data     MemberPledgeDataStruct `json:"data"`
-	Included []MemberPledgeIncluded `json:"included"`
-}
-
 type ExternalAuth interface {
 	HandleLogin(http.ResponseWriter, *http.Request)
 	HandleCallback(http.ResponseWriter, *http.Request)
@@ -187,11 +128,10 @@ type ExternalAuth interface {
 
 type PatreonAuthDb interface {
 	SaveUser(ctx context.Context, patreonID, email, givenName, surName, tierID, patronStatus, accessToken, refreshToken string, tokenExpiry pgtype.Timestamp) error
-	SaveWebhookEvent(ctx context.Context, eventTypeID, patreonID, tierID, patronStatus string, rawPayload []byte) error
-	VerifyRefreshToken(ctx context.Context, token string) (string, error)
+	RecordWebhook(ctx context.Context, rec db.WebhookRecord) error
+	RotateRefreshToken(ctx context.Context, token string) (string, error)
 	StoreRefreshToken(ctx context.Context, patreonID, token string) error
-	GetTierCodeForUser(ctx context.Context, patreonID string) (string, error)
-	GetUserIDForPatreon(ctx context.Context, patreonID string) (string, error)
+	GetUserAccount(ctx context.Context, patreonID string) (db.UserAccount, error)
 	FulfillTokenLogin(ctx context.Context, token string, userID string) error
 }
 
@@ -308,8 +248,10 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		inc[typeKey(x.Type, x.ID)] = x
 	}
 
-	// Walk the membership references on the user and find the one for YOUR campaign
-	tierTitle := "free" // sensible default
+	// Walk the membership references on the user and find the one for YOUR campaign.
+	// Lapsed patrons are admitted so the access gate can let them use credits
+	// they still have (ED78); tier is non_patron unless a tier is entitled.
+	tierTitle := nonPatronTier
 	var patronStatus string
 
 	memRefs := result.Data.Relationships.Memberships.Data // []Ref{ {id,type:"member"} ... }
@@ -325,9 +267,9 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Check status + (optionally) payment info
-		status := m.Attributes.PatronStatus // "active_patron" | "declined_patron" | "former_patron" | null
-		if status != "active_patron" {
+		// "active_patron" | "declined_patron" | "former_patron" | null (never paid)
+		status := m.Attributes.PatronStatus
+		if !admittedPatronStatuses[status] {
 			continue
 		}
 
@@ -348,22 +290,14 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !isActivePatron {
-		log.Printf("INFO: User %s is not an active patron of campaign %s", userID, forgeRealmCampaignID)
+		log.Printf("INFO: User %s is not a patron of campaign %s", userID, forgeRealmCampaignID)
 		http.Error(w, "You must be a patron to access this feature.", http.StatusForbidden)
 		return
 	}
 
-	log.Printf("INFO: User %s is an active patron (membership %s) of campaign %s, tier=%s",
-		userID, activeMembershipID, forgeRealmCampaignID, tierTitle,
+	log.Printf("INFO: User %s is a patron (membership %s, status %s) of campaign %s, tier=%s",
+		userID, activeMembershipID, patronStatus, forgeRealmCampaignID, tierTitle,
 	)
-
-	if tierTitle == "" {
-		tierTitle = "apprentice" // Default tier for active patrons
-	}
-
-	if patronStatus == "" {
-		patronStatus = "active_patron"
-	}
 
 	tokenExpiresAt := defaultExpiry(24)
 	err = a.db.SaveUser(
@@ -381,6 +315,18 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("ERROR: Failed to save user to database (Patreon ID: %s): %v", userID, err)
 		http.Error(w, "Failed to save user: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	account, err := a.db.GetUserAccount(r.Context(), userID)
+	if err != nil {
+		log.Printf("ERROR: Failed to load account for Patreon ID %s: %v", userID, err)
+		http.Error(w, "Failed to resolve user ID", http.StatusInternalServerError)
+		return
+	}
+	if account.Closed {
+		log.Printf("INFO: Refused login to closed account (Patreon ID: %s)", userID)
+		http.Error(w, "This account is closed.", http.StatusForbidden)
 		return
 	}
 	// Parse state parameter — may contain app prefix: "app:<name>:<inner_state>"
@@ -407,24 +353,10 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Look up the database UUID for this Patreon user
-	dbUserID, err := a.db.GetUserIDForPatreon(r.Context(), userID)
+	jwtToken, refreshToken, err := issueTokens(r.Context(), a.db, account)
 	if err != nil {
-		log.Printf("ERROR: Failed to get database user ID for Patreon ID %s: %v", userID, err)
-		http.Error(w, "Failed to resolve user ID", http.StatusInternalServerError)
-		return
-	}
-
-	jwtToken, err := generateJWT(dbUserID, tierTitle)
-	if err != nil {
-		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
-		return
-	}
-
-	refreshToken := generateSecureRandomToken()
-	err = a.db.StoreRefreshToken(r.Context(), userID, refreshToken)
-	if err != nil {
-		http.Error(w, "Failed to store refresh token", http.StatusInternalServerError)
+		log.Printf("ERROR: Failed to issue tokens (Patreon ID: %s): %v", userID, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -457,48 +389,44 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleRefresh exchanges a refresh token, once, for a token with the user's
+// current tier and patron_status and a new refresh token. Closed accounts are
+// refused (ED77, ED78).
 func (a *PatreonAuth) HandleRefresh(w http.ResponseWriter, r *http.Request) {
-	// Parse the request body to get the refresh token
 	var requestBody RefreshTokenRequest
-
 	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-
 	if requestBody.RefreshToken == "" {
 		http.Error(w, "Missing refresh token", http.StatusBadRequest)
 		return
 	}
 
-	patreonID, err := a.db.VerifyRefreshToken(r.Context(), requestBody.RefreshToken)
+	patreonID, err := a.db.RotateRefreshToken(r.Context(), requestBody.RefreshToken)
 	if err != nil {
+		if !errors.Is(err, db.ErrInvalidRefreshToken) {
+			log.Printf("ERROR: Failed to rotate refresh token: %v", err)
+		}
 		http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
 		return
 	}
 
-	// Get tier info from DB (if needed)
-	tierCode, _ := a.db.GetTierCodeForUser(r.Context(), patreonID)
-
-	// Look up the database UUID for this Patreon user
-	dbUserID, err := a.db.GetUserIDForPatreon(r.Context(), patreonID)
+	account, err := a.db.GetUserAccount(r.Context(), patreonID)
 	if err != nil {
-		log.Printf("ERROR: Failed to get database user ID for Patreon ID %s: %v", patreonID, err)
+		log.Printf("ERROR: Failed to load account for Patreon ID %s: %v", patreonID, err)
 		http.Error(w, "Failed to resolve user ID", http.StatusInternalServerError)
 		return
 	}
-
-	newJWT, err := generateJWT(dbUserID, tierCode)
-	if err != nil {
-		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+	if account.Closed {
+		http.Error(w, "Account closed", http.StatusForbidden)
 		return
 	}
 
-	// Generate a new refresh token
-	newRefreshToken := generateSecureRandomToken()
-	err = a.db.StoreRefreshToken(r.Context(), patreonID, newRefreshToken)
+	newJWT, newRefreshToken, err := issueTokens(r.Context(), a.db, account)
 	if err != nil {
-		http.Error(w, "Failed to store refresh token", http.StatusInternalServerError)
+		log.Printf("ERROR: Failed to issue tokens (Patreon ID: %s): %v", patreonID, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -512,8 +440,6 @@ func (a *PatreonAuth) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("ERROR: Failed to encode response: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -570,221 +496,55 @@ func generateSecureRandomToken() string {
 	return base64.URLEncoding.EncodeToString(b)
 }
 
-func generateJWT(patreonID, tierCode string) (string, error) {
+// Patron statuses login admits: active, and lapsed so the gate can let them
+// spend unexpired credits (ED78). Null (never paid) is not admitted.
+var admittedPatronStatuses = map[string]bool{
+	"active_patron":   true,
+	"declined_patron": true,
+	"former_patron":   true,
+}
+
+// patronStatusClaim is Patreon's status, or non_patron for null (PR-11 D1).
+func patronStatusClaim(status string) string {
+	if status == "" {
+		return nonPatronTier
+	}
+	return status
+}
+
+type refreshTokenStore interface {
+	StoreRefreshToken(ctx context.Context, patreonID, token string) error
+}
+
+// issueTokens issues the JWT and a refresh token for an account. Every login
+// and refresh path uses it, so all issue the same tier and patron_status.
+func issueTokens(ctx context.Context, store refreshTokenStore, account db.UserAccount) (string, string, error) {
+	jwtToken, err := generateJWT(account.ID, account.TierID, patronStatusClaim(account.PatronStatus))
+	if err != nil {
+		return "", "", fmt.Errorf("Failed to generate token")
+	}
+	refreshToken := generateSecureRandomToken()
+	if err := store.StoreRefreshToken(ctx, account.PatreonID, refreshToken); err != nil {
+		return "", "", fmt.Errorf("Failed to store refresh token")
+	}
+	return jwtToken, refreshToken, nil
+}
+
+func generateJWT(userID, tierCode, patronStatus string) (string, error) {
 	secret := strings.TrimSpace(os.Getenv("JWT_SECRET_CURRENT"))
 	if secret == "" {
 		return "", fmt.Errorf("JWT_SECRET_CURRENT environment variable is not set")
 	}
 	claims := jwt.MapClaims{
-		"sub":  patreonID,
-		"tier": tierCode,
-		"exp":  time.Now().Add(4 * time.Hour).Unix(),
-		"iat":  time.Now().Unix(),
-		"iss":  "forgerealm-auth",
+		"sub":           userID,
+		"tier":          tierCode,
+		"patron_status": patronStatus,
+		"exp":           time.Now().Add(4 * time.Hour).Unix(),
+		"iat":           time.Now().Unix(),
+		"iss":           "forgerealm-auth",
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(secret))
-}
-
-// verifySignature verifies the webhook signature
-func verifySignature(r *http.Request, signature string) bool {
-	secret := strings.TrimSpace(os.Getenv("WEBHOOK_SECRET"))
-	if secret == "" {
-		log.Printf("ERROR: WEBHOOK_SECRET environment variable is not set")
-		return false
-	}
-
-	// Read request body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("ERROR: Failed to read request body for signature verification: %v", err)
-		return false
-	}
-	// Restore the body for later use
-	r.Body = io.NopCloser(bytes.NewReader(body))
-
-	// Calculate HMAC
-	h := hmac.New(md5.New, []byte(secret))
-	h.Write(body)
-	expectedSignature := hex.EncodeToString(h.Sum(nil))
-
-	isValid := hmac.Equal([]byte(signature), []byte(expectedSignature))
-	if !isValid {
-		log.Printf("ERROR: Invalid webhook signature. Expected: %s, Received: %s", expectedSignature, signature)
-	}
-	return isValid
-}
-
-func (a *PatreonAuth) HandleWebhook(w http.ResponseWriter, r *http.Request) {
-	// Verify webhook signature
-	signature := r.Header.Get("X-Patreon-Signature")
-	if !verifySignature(r, signature) {
-		log.Printf("ERROR: Webhook signature verification failed")
-		http.Error(w, "Invalid signature", http.StatusUnauthorized)
-		return
-	}
-
-	var event WebhookEvent
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-		log.Printf("ERROR: Failed to decode webhook event JSON: %v", err)
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("INFO: Processing webhook event: %s for Patreon ID: %s", event.EventType, event.PatreonID)
-
-	// Parse the payload based on event type
-	var pledgeData MemberPledgeData
-	if event.EventType == "members:create" || event.EventType == "members:update" {
-		if err := json.Unmarshal(event.Payload, &pledgeData); err != nil {
-			log.Printf("ERROR: Failed to parse member payload for Patreon ID %s: %v", event.PatreonID, err)
-			http.Error(w, "Invalid pledge data", http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Save webhook event to database
-	if err := a.db.SaveWebhookEvent(r.Context(), event.EventType, event.PatreonID, event.TierID, event.PatronStatus, event.Payload); err != nil {
-		log.Printf("ERROR: Failed to save webhook event to database (Event: %s, Patreon ID: %s): %v", event.EventType, event.PatreonID, err)
-		http.Error(w, "Failed to save webhook event", http.StatusInternalServerError)
-		return
-	}
-
-	// Process webhook event based on type
-	switch event.EventType {
-	case "members:create":
-		a.handleMemberCreate(event.PatreonID, event.TierID, event.PatronStatus, pledgeData)
-	case "members:update":
-		a.handleMemberUpdate(event.PatreonID, event.TierID, event.PatronStatus, pledgeData)
-	case "members:delete":
-		a.handleMemberDelete(event.PatreonID)
-	default:
-		log.Printf("WARN: Unknown webhook event type: %s for Patreon ID: %s", event.EventType, event.PatreonID)
-	}
-
-	log.Printf("INFO: Successfully processed webhook event: %s for Patreon ID: %s", event.EventType, event.PatreonID)
-	w.WriteHeader(http.StatusOK)
-}
-
-// getTierCodeFromPledgeData extracts the tier code from pledge data
-func getTierCodeFromPledgeData(data MemberPledgeData) string {
-	// If no entitled tiers, return empty string
-	if len(data.Data.Relationships.CurrentlyEntitledTiers.Data) == 0 {
-		return ""
-	}
-
-	// Get the first entitled tier ID
-	tierID := data.Data.Relationships.CurrentlyEntitledTiers.Data[0].ID
-
-	// Look for the tier in the included data to get the title
-	for _, included := range data.Included {
-		if included.Type == "tier" && included.ID == tierID {
-			// Map tier titles to tier codes
-			switch included.Attributes.Title {
-			case "Apprentice":
-				return "apprentice"
-			case "Journeyman":
-				return "journeyman"
-			case "Master":
-				return "master"
-			default:
-				// For unknown tiers, use the title as the code (lowercase)
-				return strings.ToLower(included.Attributes.Title)
-			}
-		}
-	}
-
-	// If we can't find the tier details, return a default
-	return "apprentice"
-}
-
-// handleMemberCreate processes member creation events
-func (a *PatreonAuth) handleMemberCreate(patreonID, tierID, patronStatus string, data MemberPledgeData) {
-	log.Printf("INFO: Processing member create event for Patreon ID: %s, Tier: %s, Status: %s", patreonID, tierID, patronStatus)
-
-	// Extract tier code from pledge data
-	tierCode := getTierCodeFromPledgeData(data)
-	log.Printf("INFO: Extracted tier code '%s' from pledge data for Patreon ID: %s", tierCode, patreonID)
-
-	tokenExpiry := defaultExpiry(24)
-
-	err := a.db.SaveUser(
-		context.Background(),
-		patreonID,
-		data.Data.Attributes.Email,
-		data.Data.Attributes.FirstName,
-		data.Data.Attributes.LastName,
-		tierCode,
-		patronStatus,
-		"", // No access token for webhook events
-		"", // No refresh token for webhook events
-		tokenExpiry,
-	)
-
-	if err != nil {
-		log.Printf("ERROR: Failed to save user from member create webhook (Patreon ID: %s): %v", patreonID, err)
-		return
-	}
-
-	log.Printf("INFO: Successfully saved user from member create webhook (Patreon ID: %s)", patreonID)
-}
-
-// handleMemberUpdate processes member update events
-func (a *PatreonAuth) handleMemberUpdate(patreonID, tierID, patronStatus string, data MemberPledgeData) {
-	log.Printf("INFO: Processing member update event for Patreon ID: %s, Tier: %s, Status: %s", patreonID, tierID, patronStatus)
-
-	// Extract tier code from pledge data
-	tierCode := getTierCodeFromPledgeData(data)
-	log.Printf("INFO: Extracted tier code '%s' from pledge data for Patreon ID: %s", tierCode, patreonID)
-
-	tokenExpiry := defaultExpiry(24)
-
-	err := a.db.SaveUser(
-		context.Background(),
-		patreonID,
-		data.Data.Attributes.Email,     // Use email from pledge data
-		data.Data.Attributes.FirstName, // Use first name from pledge data
-		data.Data.Attributes.LastName,  // Use last name from pledge data
-		tierCode,                       // Use the extracted tier code instead of tierID
-		patronStatus,
-		"", // Keep existing access token
-		"", // Keep existing refresh token
-		tokenExpiry,
-	)
-
-	if err != nil {
-		log.Printf("ERROR: Failed to save user from member update webhook (Patreon ID: %s): %v", patreonID, err)
-		return
-	}
-
-	log.Printf("INFO: Successfully saved user from member update webhook (Patreon ID: %s)", patreonID)
-}
-
-// handleMemberDelete processes member deletion events
-func (a *PatreonAuth) handleMemberDelete(patreonID string) {
-	log.Printf("INFO: Processing member delete event for Patreon ID: %s", patreonID)
-
-	tokenExpiry := defaultExpiry(24)
-
-	err := a.db.SaveUser(
-		context.Background(),
-		patreonID,
-		"", // Keep existing email
-		"", // Keep existing given name
-		"", // Keep existing surname
-		"", // Clear tier ID
-		"former_patron",
-		"", // Keep existing access token
-		"", // Keep existing refresh token
-		tokenExpiry,
-	)
-
-	if err != nil {
-		log.Printf("ERROR: Failed to save user from member delete webhook (Patreon ID: %s): %v", patreonID, err)
-		return
-	}
-
-	log.Printf("INFO: Successfully saved user from member delete webhook (Patreon ID: %s)", patreonID)
 }
 
 func defaultExpiry(hours int) pgtype.Timestamp {

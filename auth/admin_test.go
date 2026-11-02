@@ -246,12 +246,15 @@ func TestAdminUsers_TokenRules(t *testing.T) {
 	a := NewAdmin(&fakeAdminDB{byEmail: []db.UserSummary{{ID: testUserID}}})
 	now := time.Now()
 	cases := map[string]string{
-		"none":          "",
-		"user token":    userToken(t, nil),
-		"wrong secret":  signHS256(t, "other", jwt.MapClaims{"sub": testUserID, "iss": adminIssuer, "aud": adminAudience, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix()}),
-		"wrong issuer":  adminToken(t, func(c jwt.MapClaims) { c["iss"] = "forgerealm-auth" }),
-		"wrong aud":     adminToken(t, func(c jwt.MapClaims) { c["aud"] = "someone" }),
-		"expired":       adminToken(t, func(c jwt.MapClaims) { c["iat"] = now.Add(-2 * time.Hour).Unix(); c["exp"] = now.Add(-time.Hour).Unix() }),
+		"none":         "",
+		"user token":   userToken(t, nil),
+		"wrong secret": signHS256(t, "other", jwt.MapClaims{"sub": testUserID, "iss": adminIssuer, "aud": adminAudience, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix()}),
+		"wrong issuer": adminToken(t, func(c jwt.MapClaims) { c["iss"] = "forgerealm-auth" }),
+		"wrong aud":    adminToken(t, func(c jwt.MapClaims) { c["aud"] = "someone" }),
+		"expired": adminToken(t, func(c jwt.MapClaims) {
+			c["iat"] = now.Add(-2 * time.Hour).Unix()
+			c["exp"] = now.Add(-time.Hour).Unix()
+		}),
 		"no iat":        adminToken(t, func(c jwt.MapClaims) { delete(c, "iat") }),
 		"future iat":    adminToken(t, func(c jwt.MapClaims) { c["iat"] = now.Add(time.Minute).Unix(); c["exp"] = now.Add(time.Hour).Unix() }),
 		"too long":      adminToken(t, func(c jwt.MapClaims) { c["exp"] = now.Add(time.Hour + time.Second).Unix() }),
@@ -265,6 +268,9 @@ func TestAdminUsers_TokenRules(t *testing.T) {
 		})
 	}
 	// An iat within the 30 s skew is accepted, as AtlasForge does.
-	ok := adminToken(t, func(c jwt.MapClaims) { c["iat"] = now.Add(20 * time.Second).Unix(); c["exp"] = now.Add(time.Hour).Unix() })
+	ok := adminToken(t, func(c jwt.MapClaims) {
+		c["iat"] = now.Add(20 * time.Second).Unix()
+		c["exp"] = now.Add(time.Hour).Unix()
+	})
 	assert.Equal(t, http.StatusOK, lookup(a, ok, "email=pat@example.com").Code)
 }

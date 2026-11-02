@@ -66,6 +66,10 @@ go run main.go
 ### Optional Variables
 - `PORT`: Server port (default: 8080)
 - `PATREON_REDIRECT_URL`: OAuth2 callback URL (default: https://theforgerealm.com/auth/callback)
+- `PATREON_AUTHORIZE_URL`: Patreon authorize page the browser opens (default: https://www.patreon.com/oauth2/authorize)
+- `PATREON_TOKEN_URL`: Patreon token endpoint (default: https://www.patreon.com/api/oauth2/token)
+- `PATREON_API_BASE`: Base of the Patreon identity API (default: https://www.patreon.com)
+- `ATLASFORGE_CALLBACK_URL`: Where `/auth/login?app=atlasforge` lands after login (default: https://theforgerealm.com/atlasforge/auth/callback)
 
 ## API Endpoints
 
@@ -199,6 +203,34 @@ forgerealm-auth/
 - `auth/patreon.go`: Patreon OAuth2 and webhook handling
 - `db/db.go`: Database interface and PostgreSQL implementation
 - `main.go`: HTTP server setup and routing
+
+### Local development with the mock Patreon
+
+`mockpatreon/` fakes Patreon's authorize page, token exchange and identity endpoint, with fixed test users. `dev/docker-compose.yml` runs auth, its Postgres (migrations from `scripts/`) and the mock:
+
+```bash
+docker compose -f dev/docker-compose.yml up --build
+```
+
+Open http://localhost:3099/auth/login and pick a user. `?mock_user=<key>` on the authorize URL skips the page.
+
+| Key | Result |
+|---|---|
+| `apprentice`, `journeyman`, `master` | Active patron with that tier |
+| `lapsed` | Former patron, tier `non_patron` |
+| `declined` | Declined patron, tier `master` |
+| `admin` | Active, tier `master` |
+| `stranger` | Patron of another campaign only, refused with 403 |
+
+Make `admin` an admin after its first login:
+
+```bash
+docker compose -f dev/docker-compose.yml exec auth-db \
+  psql -U forgerealm -d forgerealm_auth -c \
+  "UPDATE forgerealm_auth.users SET role_id = 'admin' WHERE patreon_id = 'mock-admin';"
+```
+
+`dev/auth.env` holds the dev-only values, shared with AtlasForge's local compose. Both Dockerfiles build with the repo root as the context.
 
 ## License
 

@@ -39,7 +39,8 @@ type AdminDatabase interface {
 	FindUserByPatreonID(ctx context.Context, patreonID string) (db.UserSummary, error)
 }
 
-// Admin serves /admin/token and /admin/users.
+// Admin serves /auth/admin/token and /auth/admin/users. They sit under /auth
+// because the load balancer sends only /auth to this service.
 type Admin struct {
 	db  AdminDatabase
 	now func() time.Time
@@ -49,7 +50,7 @@ func NewAdmin(store AdminDatabase) *Admin {
 	return &Admin{db: store, now: time.Now}
 }
 
-// UserLookupResponse is the body of GET /admin/users.
+// UserLookupResponse is the body of GET /auth/admin/users.
 type UserLookupResponse struct {
 	UserID       string `json:"userId"`
 	Email        string `json:"email"`
@@ -73,8 +74,8 @@ func writeError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]string{"error": code})
 }
 
-// HandleToken exchanges a user token for an admin token when the user's role,
-// read now, is admin and the account is open.
+// HandleToken (POST /auth/admin/token) exchanges a user token for an admin
+// token when the user's role, read now, is admin and the account is open.
 func (a *Admin) HandleToken(w http.ResponseWriter, r *http.Request) {
 	secret := adminSecret()
 	if secret == "" {
@@ -116,7 +117,8 @@ func (a *Admin) HandleToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
-// HandleUsers looks up one user by email or Patreon id for the admin screen.
+// HandleUsers (GET /auth/admin/users) looks up one user by email or Patreon
+// id for the admin screen.
 func (a *Admin) HandleUsers(w http.ResponseWriter, r *http.Request) {
 	secret := adminSecret()
 	if secret == "" {

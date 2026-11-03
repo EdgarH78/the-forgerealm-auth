@@ -1,0 +1,15 @@
+# Mock Patreon for local development (AUTH-3). Build with the repo root as the
+# context: docker build -f Dockerfile.mockpatreon .
+FROM golang:1.23-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY mockpatreon ./mockpatreon
+COPY cmd/mockpatreon ./cmd/mockpatreon
+RUN CGO_ENABLED=0 GOOS=linux go build -o mockpatreon ./cmd/mockpatreon
+
+FROM alpine:3.20
+WORKDIR /app
+COPY --from=builder /app/mockpatreon .
+EXPOSE 8090
+CMD ["./mockpatreon"]

@@ -36,16 +36,14 @@ func main() {
 	}
 
 	log.Printf("INFO: Using Patreon redirect URL: %s", PATREON_REDIRECT_URL)
+	log.Printf("INFO: Using Patreon endpoints: %+v", auth.PatreonEndpoint())
 
 	patreonOAuthConfig := &oauth2.Config{
 		ClientID:     strings.TrimSpace(os.Getenv("PATREON_CLIENT_ID")),
 		ClientSecret: strings.TrimSpace(os.Getenv("PATREON_CLIENT_SECRET")),
 		RedirectURL:  PATREON_REDIRECT_URL,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://www.patreon.com/oauth2/authorize",
-			TokenURL: "https://www.patreon.com/api/oauth2/token",
-		},
-		Scopes: []string{"identity", "identity[email]", "identity.memberships"},
+		Endpoint:     auth.PatreonEndpoint(),
+		Scopes:       []string{"identity", "identity[email]", "identity.memberships"},
 	}
 
 	// Initialize database

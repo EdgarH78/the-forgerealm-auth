@@ -1,0 +1,48 @@
+# forgerealm-auth with its Postgres and the mock Patreon (AUTH-3). From the repo
+# root: docker compose -f dev/docker-compose.yml up --build
+# Log in at http://localhost:3099/auth/login and pick a test user.
+# AtlasForge's compose copies these services, with build contexts pointing at a
+# sibling checkout of this repo.
+services:
+  auth-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: forgerealm
+      POSTGRES_PASSWORD: forgerealm
+      POSTGRES_DB: forgerealm_auth
+    volumes:
+      # Runs 001 to 004 in order on the first start of an empty volume. z lets
+      # SELinux hosts (Fedora) read the directory.
+      - ../scripts:/docker-entrypoint-initdb.d:ro,z
+      - auth-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgerealm -d forgerealm_auth"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mock-patreon:
+    build:
+      context: ..
+      dockerfile: Dockerfile.mockpatreon
+    environment:
+      PATREON_CLIENT_ID: mock-client-id
+      PATREON_CLIENT_SECRET: mock-client-secret
+    ports:
+      - "8090:8090"
+
+  auth:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file: auth.env
+    ports:
+      - "3099:8080"
+    depends_on:
+      auth-db:
+        condition: service_healthy
+      mock-patreon:
+        condition: service_started
+
+volumes:
+  auth-db-data:

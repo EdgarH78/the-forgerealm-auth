@@ -197,7 +197,7 @@ func (a *PatreonAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Call identity with the relationships/fields you actually need
 	resp, err := client.Get(
-		"https://www.patreon.com/api/oauth2/v2/identity" +
+		patreonAPIBase() + "/api/oauth2/v2/identity" +
 			"?include=memberships,memberships.campaign,memberships.currently_entitled_tiers" +
 			"&fields[user]=email,first_name,last_name" +
 			"&fields[member]=patron_status" +
@@ -477,11 +477,34 @@ func (a *PatreonAuth) HandleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// envOr returns the trimmed env value, or def when it is unset or blank.
+func envOr(name, def string) string {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+	return def
+}
+
+// PatreonEndpoint is Patreon's OAuth endpoint. Local development points it at
+// the mock (cmd/mockpatreon). The authorize URL is the one the browser opens,
+// the token URL the one this server calls, so they may name different hosts.
+func PatreonEndpoint() oauth2.Endpoint {
+	return oauth2.Endpoint{
+		AuthURL:  envOr("PATREON_AUTHORIZE_URL", "https://www.patreon.com/oauth2/authorize"),
+		TokenURL: envOr("PATREON_TOKEN_URL", "https://www.patreon.com/api/oauth2/token"),
+	}
+}
+
+// patreonAPIBase is where the identity call goes.
+func patreonAPIBase() string {
+	return strings.TrimRight(envOr("PATREON_API_BASE", "https://www.patreon.com"), "/")
+}
+
 // appRedirectURL returns the post-login redirect URL for a known app.
 // Tokens are passed as URL-safe query params; the app's callback page reads them.
 func appRedirectURL(appName, jwtToken, refreshToken string) string {
 	knownApps := map[string]string{
-		"atlasforge": "https://theforgerealm.com/atlasforge/auth/callback",
+		"atlasforge": envOr("ATLASFORGE_CALLBACK_URL", "https://theforgerealm.com/atlasforge/auth/callback"),
 	}
 	base, ok := knownApps[appName]
 	if !ok {
